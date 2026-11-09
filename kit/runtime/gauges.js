@@ -296,7 +296,7 @@ function rampSlab(cv, x0, x1, y, h, sl, stops, spanX, spanW) {
  * on it; below it in g.negColor. g.head: false leaves out the label / value row (the bar at y).
  * g.track: the empty track's colour. g.ticks: the values marked on the scale line; g.labels:
  * [{ value, text, color, align }] in place of its numbers. g.text / g.valueColor: the value row's text and colour
- * in place of the formatted value.
+ * in place of the formatted value. g.labelSize: the label's size (22).
  */
 function bar(cv, t, x, y, w, h, g) {
     const min = g.min || 0, v = g.value;
@@ -305,7 +305,7 @@ function bar(cv, t, x, y, w, h, g) {
     if (g.niceMax) max = min + Math.ceil((max - min) / step - 1e-9) * step;
     const sv = sm(g, 'bar|' + x + '|' + y, v), head = g.head !== false;
     if (head) {
-        cv.text(upperText(g.label || ''), x, y + 26, 22, t.dim, { font: 'bold', spacing: 2 });
+        cv.text(upperText(g.label || ''), x, y + 26, g.labelSize || 22, t.dim, { font: 'bold', spacing: 2 });
         const uw = g.unit ? cv.textWidth(' ' + g.unit, 26) : 0;
         cv.text(g.text != null ? g.text : fmt(v, g.decimals), x + w - uw, y + 30, 44, g.valueColor ? t[g.valueColor] || g.valueColor : isNum(v) ? t.text : t.dim, { align: 'right', font: 'num' });
         if (g.unit) cv.text(' ' + g.unit, x + w, y + 30, 26, t.dim, { align: 'right' });

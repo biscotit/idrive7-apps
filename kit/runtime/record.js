@@ -11,7 +11,7 @@
  *
  * Recording a whole frame costs well under a millisecond; nothing here touches pixels.
  */
-const { Canvas, rgba } = require('./canvas');
+const { Canvas, ScaledCanvas, rgba } = require('./canvas');
 const fonts = require('./fonts');
 const { t } = require('./i18n');
 
@@ -294,6 +294,12 @@ function softLayer(L) {
     if (!L.soft) { L.soft = new Canvas(L.w, L.h); play(L.words, L.soft); }
     return L.soft;
 }
+/** a layer drawn at k device pixels per pixel (into a ScaledCanvas: sharp, not a 1x picture blown up) */
+function sharpLayer(L, k) {
+    const m = L.sharp || (L.sharp = {});
+    if (!m[k]) { m[k] = new ScaledCanvas(L.w, L.h, k); play(L.words, m[k]); }
+    return m[k];
+}
 
 const NOP = new Proxy({}, { get: () => () => 0 });
 
@@ -352,7 +358,7 @@ function play(words, real) {
             }
             i += k * 8; break;
         }
-        case OP.LAYER: { const L = layerById.get(u[i]); if (L) cv.blit(softLayer(L), f[i + 1], f[i + 2]); i += 3; break; }
+        case OP.LAYER: { const L = layerById.get(u[i]); if (L) cv.blit(typeof cv.k === 'number' && cv.k !== 1 ? sharpLayer(L, cv.k) : softLayer(L), f[i + 1], f[i + 2]); i += 3; break; }
         case OP.IMAGE: { const im = imageById.get(u[i]); if (im && cv.drawImage) cv.drawImage(im.data, im.w, im.h, f[i + 2], f[i + 3], f[i + 4], f[i + 5]); i += 6; break; }
         case OP.CLIP: clip = [f[i], f[i + 1], f[i + 2], f[i + 3]]; i += 4; break;     // (software path: ignored)
         case OP.NOCLIP: clip = null; break;

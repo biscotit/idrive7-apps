@@ -109,6 +109,29 @@ class Canvas {
         return this;
     }
 
+    /**
+     * blit() scaled: src drawn into x, y, w, h, nearest pixel, alpha-blended as blit() does (transparent
+     * pixels skipped, opaque ones copied, the rest blended). drawImage() is for opaque images: it sets alpha 255.
+     */
+    blitScaled(src, x, y, w, h) {
+        const x0 = Math.max(0, Math.round(x)), y0 = Math.max(0, Math.round(y));
+        const x1 = Math.min(this.w, Math.round(x + w)), y1 = Math.min(this.h, Math.round(y + h));
+        if (x1 <= x0 || y1 <= y0) return this;
+        const sw = src.w, sh = src.h, s = src.d, d = this.d, fx = sw / w, fy = sh / h, px = [0, 0, 0, 255];
+        for (let py = y0; py < y1; py++) {
+            const sy = Math.min(sh - 1, ((py - y + 0.5) * fy) | 0) * sw;
+            let di = (py * this.w + x0) * 4;
+            for (let qx = x0; qx < x1; qx++, di += 4) {
+                const si = (sy + Math.min(sw - 1, ((qx - x + 0.5) * fx) | 0)) * 4, a = s[si + 3];
+                if (a === 0) continue;
+                if (a === 255) { d[di] = s[si]; d[di + 1] = s[si + 1]; d[di + 2] = s[si + 2]; d[di + 3] = 255; continue; }
+                px[0] = s[si]; px[1] = s[si + 1]; px[2] = s[si + 2]; px[3] = a;
+                this._blend(qx, py, px, 1);
+            }
+        }
+        return this;
+    }
+
     /** Copy an opaque canvas to (x, y) row by row (no blending: memcpy per row), clipped. */
     copyRows(src, x, y) {
         x = Math.round(x); y = Math.round(y);
@@ -532,7 +555,13 @@ class ScaledCanvas {
     polyline(pts, width, c) { this.canvas.polyline(this._pts(pts), width * this.k, c); return this; }
     fillUnder(pts, baseY, c) { this.canvas.fillUnder(this._pts(pts), baseY * this.k, c); return this; }
     drawImage(src, sw, sh, x, y, w, h) { const k = this.k; this.canvas.drawImage(src, sw, sh, x * k, y * k, w * k, h * k); return this; }
-    blit(src, x, y) { return this.drawImage(src.d, src.w, src.h, x, y, src.w, src.h); }
+    // another canvas (a layer), alpha-blended: one of this density 1:1, else scaled (not drawImage: it drops alpha)
+    blit(src, x, y) {
+        const k = this.k;
+        if (src.canvas && src.k === k) this.canvas.blit(src.canvas, x * k, y * k);
+        else this.canvas.blitScaled(src, x * k, y * k, src.w * k, src.h * k);
+        return this;
+    }
     text(str, x, y, size, c, opts) {
         const k = this.k, o = opts && opts.spacing ? Object.assign({}, opts, { spacing: opts.spacing * k }) : opts;
         return this.canvas.text(str, x * k, y * k, size * k, c, o) / k;

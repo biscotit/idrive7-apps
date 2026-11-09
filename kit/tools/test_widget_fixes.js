@@ -77,5 +77,54 @@ const Car = require(path.join(KIT, 'car'));
     assert.strictEqual(sw.scale, 2, id);
 });
 
+/* ---------- a layer on a widget's picture keeps its transparency (no black square round a dial) ---------- */
+{
+    const L = new Canvas(10, 10);
+    L.fillRect(2, 2, 6, 6, [255, 255, 255, 255]);
+    L.fillRect(8, 8, 1, 1, [255, 0, 0, 128]);
+    const cv = new ScaledCanvas(20, 20, 2).clear([0, 0, 0, 0]).blit(L, 0, 0);
+    const a = (x, y) => cv.canvas.d[(y * 40 + x) * 4 + 3];
+    assert.strictEqual(a(0, 0), 0, 'a transparent corner stays transparent');
+    assert.strictEqual(a(6, 6), 255, 'an opaque pixel is copied');
+    assert.ok(a(17, 17) > 0 && a(17, 17) < 255, 'a translucent one stays translucent: ' + a(17, 17));
+    // through a recording, as the widget is drawn: a dial (a cached layer) leaves no opaque black
+    const G = require(path.join(KIT, 'gauges')), T = require(path.join(KIT, 'themes'));
+    const { Recorder, play } = require(path.join(KIT, 'record'));
+    const rec = new Recorder(200, 200, { textScale: 2 }).reset();
+    G.radial(rec, T.theme('m_tricolour'), 100, 100, 70, { value: 776, min: 0, max: 8000, tickLabels: false });
+    const pic = new ScaledCanvas(200, 200, 2).clear([0, 0, 0, 0]);
+    play(rec.words(), pic);
+    const d = pic.canvas.d;
+    assert.strictEqual(d[3], 0, "the dial layer's corner is see-through");
+    let black = 0;
+    for (let i = 0; i < d.length; i += 4) if (d[i + 3] === 255 && !d[i] && !d[i + 1] && !d[i + 2]) black++;
+    assert.strictEqual(black, 0, 'no opaque black pixels');
+}
+
+/* ---------- Live Data's widget: a bar's label fits beside its value (not "ENGINE SP...") ---------- */
+{
+    const G = require(path.join(KIT, 'gauges')), T = require(path.join(KIT, 'themes'));
+    const { Recorder } = require(path.join(KIT, 'record'));
+    const SCR = require(path.join(ROOT, 'apps', 'live_data', 'screens'));
+    const sw = require(path.join(ROOT, 'apps', 'live_data', 'app.json')).startWidget;
+    const box = SCR.widgetBox(sw.size[0], sw.size[1], sw.safe, 'medium');
+    const drawn = (rpm) => {
+        const rec = new Recorder(sw.size[0], sw.size[1], { textScale: sw.scale }).reset(), texts = [];
+        const text = rec.text.bind(rec);
+        rec.text = (s, x, y, size, c, o) => { texts.push({ s: String(s), size }); return text(s, x, y, size, c, o); };
+        const fit = (cv, s) => s;      // the label must fit without being cut
+        const slots = [{ name: 'Engine speed', n: rpm, u: 'rpm', d: 0, sc: { min: 0, max: 8000, div: 1000 } },
+            { name: 'Engine oil', n: 93, u: '°C', d: 0, sc: { min: 0, max: 150 } }];
+        SCR.draw(rec, T.theme('m_tricolour'), G, SCR.layout('bar3'), slots, box, true, -1, fit);
+        return { texts, w: rec.textWidth.bind(rec) };
+    };
+    const r = drawn(776), lab = r.texts.find((x) => x.s === 'ENGINE SPEED');
+    assert.ok(lab, 'the whole label is drawn');
+    assert.ok(lab.size >= 14 && lab.size <= 22, 'a readable size: ' + lab.size);
+    assert.ok(r.w('ENGINE SPEED', lab.size, { font: 'bold', spacing: 2 }) + r.w('8000', 44, { font: 'num' }) + r.w(' rpm', 26) <= box.w,
+        'label and the widest value fit the widget');
+    assert.strictEqual(drawn(6400).texts.find((x) => x.s === 'ENGINE SPEED').size, lab.size, 'its size stays as the value grows');
+}
+
 console.log('Widget picture, stopped engine and eDrive settings checks passed.');
 process.exit(0);    // the Car's demo timer would keep this running

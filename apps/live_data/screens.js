@@ -212,10 +212,16 @@ const SMALL = {
         label(cv, t, G, s.name, cx, cy + r * 0.92, b.w - 4, fit, 'center');
     },
     bar(cv, t, G, s, b, fit) {
-        // the sport display bar, its label shortened to leave room for the value
-        const vw = cv.textWidth(isNum(s.n) ? numText(s) : '--', 44, { font: 'num' }) + (s.u ? cv.textWidth(' ' + s.u, 26) : 0);
+        // the sport display bar: its label beside room for the widest value of the scale (so it doesn't
+        // change as the value does), smaller rather than cut off ("ENGINE SPEED", not "ENGINE SP...")
+        const widest = [isNum(s.n) ? numText(s) : '--', numText({ n: s.sc.max, d: s.d }), numText({ n: s.sc.min, d: s.d })]
+            .reduce((m, v) => Math.max(m, cv.textWidth(v, 44, { font: 'num' })), 0);
+        const room = b.w - widest - (s.u ? cv.textWidth(' ' + s.u, 26) : 0) - 14;
+        const name = short(s.name).toUpperCase(), lo = { font: 'bold', spacing: 2 };   // as G.bar draws it
+        let ls = 22;
+        while (ls > 14 && cv.textWidth(name, ls, lo) > room) ls--;
         G.bar(cv, t, b.x, b.y + Math.max(0, (b.h - 92) / 2), b.w, 92, {
-            label: fit(cv, short(s.name).toUpperCase(), 22, (b.w - vw - 24) * 0.88, { font: 'bold' }), value: valueOf(s), unit: s.u, decimals: s.d,
+            label: fit(cv, name, ls, room, lo), labelSize: ls, value: valueOf(s), unit: s.u, decimals: s.d,
             min: s.sc.min, max: s.sc.max, niceMax: true, ramp: 'hot', peak: s.peak, zones: s.sc.zones,
         });
     },
