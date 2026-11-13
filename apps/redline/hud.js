@@ -75,7 +75,7 @@ const monoMs = () => { const t = process.hrtime(); return t[0] * 1000 + t[1] / 1
 const CLIMB_WIN_MS = 250, CLIMB_KEEP_MS = 450, CLIMB_MIN_DT = 10;
 // how far a sample's time follows its arrival (the rest: the sample before plus the usual step), once CLIMB_LOCK
 // steps are known and while the arrival is within CLIMB_NEAR of a step of where it was expected
-const CLIMB_FOLLOW = 0.2, CLIMB_LOCK = 6, CLIMB_NEAR = 0.4;
+const CLIMB_FOLLOW = 0.2, CLIMB_LOCK = 6, CLIMB_NEAR = 0.6, CLIMB_GAPS = 15;
 /** Slope (rpm/s) of samples [[tMs, rpm], ...] by least squares; null with fewer than 3 or no spread in time. */
 function slopeOf(s) {
     const n = s.length;
@@ -94,8 +94,10 @@ function slopeOf(s) {
  *   up   = how many samples in a row rose (over 300 rpm/s): a lone spike is 1;
  *   sure = the rate two samples in a row agree on (the lower of this one's and the last one's): what the lead
  *          and the count go by, so one spiky sample on a climb doesn't throw the flash point forward;
- *   rise = when the revs last really climbed (a rising sample with the rate over 300);
  *   fall = since when they have been falling (over 150 rpm/s down, sample after sample), or null;
+ *   step = rpm/s between the last two samples (falls too): the quickest sign that a climb has stopped;
+ *   even = the last sample came a usual step after the one before: not after a gap, not in a bunch (the app
+ *          held up, then its queued samples all at once), where the step's time is not known;
  *   move = rpm/s for drawing between samples (shownRpm), falls too; rpm, t = the last sample; n = how many;
  *   dt = the usual time between samples (ms), jit = how far arrivals usually are off it (ms; the log).
  * The same reading again is no news (a frame or a speed sample between two rpm samples); unchanged for 500 ms it is
@@ -103,24 +105,36 @@ function slopeOf(s) {
  * The car takes its readings at even steps, but they arrive some ms early or late (its gateways, the event loop),
  * and at 4000 rpm/s 15 ms is 60 rpm. So a sample's time is the one before plus the usual step, drawn a fifth of
  * the way to when it arrived; an arrival far from that (a reading missed, uneven steps) is taken as it came.
+ * Times only go forward: a sample that arrives before half a step has passed since the last one's time (that one
+ * came early, this one close behind) is put a whole step after it.
  */
 function climbFeed(c, rpm, tMs) {
-    if (!c.s) { c.s = []; c.rate = 0; c.sure = 0; c.up = 0; c.fall = null; c.move = 0; c.n = 0; c.dt = 0; c.jit = 0; c.k = 0; c.odd = 0; c.rpm = null; }
-    if (!isNum(rpm) || !isNum(tMs)) { c.s = []; c.rate = 0; c.sure = 0; c.up = 0; c.fall = null; c.move = 0; c.rpm = null; return c; }
+    if (!c.s) { c.s = []; c.rate = 0; c.sure = 0; c.up = 0; c.step = 0; c.fall = null; c.move = 0; c.n = 0; c.dt = 0; c.jit = 0; c.k = 0; c.g = []; c.rpm = null; }
+    if (!isNum(rpm) || !isNum(tMs)) { c.s = []; c.rate = 0; c.sure = 0; c.up = 0; c.step = 0; c.fall = null; c.move = 0; c.rpm = null; return c; }
     let s = c.s, last = s.length ? s[s.length - 1] : null;
     if (last && tMs < c.at) { s = c.s = []; last = null; }                // the clock went back: afresh
     if (last && rpm === last[1] && tMs - c.at < 500) return c;
+    c.even = !last || (tMs - c.at >= CLIMB_MIN_DT && !(c.dt > 0 && tMs - c.at > c.dt * 2.5));
     if (last && tMs - c.at < CLIMB_MIN_DT) s.pop();
     const prev = s.length ? s[s.length - 1] : null;
     let th = tMs;
     if (prev) {
-        // the usual step: the mean of the first ones, then slowly following; one far off (a reading missed)
-        // doesn't count, five in a row are a new step
+        // the usual step: the median of the last CLIMB_GAPS arrivals' gaps (a reading missed or the same again,
+        // so a gap of two steps, doesn't move it), followed slowly
         const gap = tMs - c.at;
-        if (gap < 300 && c.k >= CLIMB_LOCK && Math.abs(gap - c.dt) > c.dt * 0.5) { if (++c.odd >= 5) { c.k = 0; c.odd = 0; } }
-        else if (gap < 300) { c.odd = 0; c.k++; if (c.k > 1) c.jit += (Math.abs(gap - c.dt) - c.jit) / Math.min(c.k, 50); c.dt += (gap - c.dt) / Math.min(c.k, 20); }
+        if (gap < 300) {
+            c.g.push(gap);
+            if (c.g.length > CLIMB_GAPS) c.g.shift();
+            const med = c.g.slice().sort((x, y) => x - y)[c.g.length >> 1];
+            c.dt = c.k ? c.dt + (med - c.dt) * 0.2 : med;
+            c.k = c.g.length;
+            if (Math.abs(gap - c.dt) < c.dt * 0.5) c.jit += (Math.abs(gap - c.dt) - c.jit) * 0.05;
+        }
         const want = prev[0] + c.dt;
         if (c.k >= CLIMB_LOCK && Math.abs(tMs - want) < c.dt * CLIMB_NEAR) th = want + (tMs - want) * CLIMB_FOLLOW;
+        else if (c.k >= CLIMB_LOCK && th < prev[0] + c.dt * 0.5) th = want;
+        // never far ahead of the clock, never back
+        th = Math.max(prev[0] + 1, Math.min(th, tMs + c.dt * 0.5));
     }
     s.push([th, rpm]);
     while (s.length > 3 && th - s[0][0] > CLIMB_WIN_MS) s.shift();
@@ -128,6 +142,7 @@ function climbFeed(c, rpm, tMs) {
     c.rpm = rpm; c.t = th; c.at = tMs; c.n++;
     if (!prev) { c.move = 0; return c; }
     const dt = th - prev[0], r = (rpm - prev[1]) * 1000 / dt;
+    c.step = r;
     if (r < -150) { if (c.fall == null) c.fall = prev[0]; } else c.fall = null;
     let k = null;
     const was = c.rate || 0;
@@ -138,7 +153,6 @@ function climbFeed(c, rpm, tMs) {
         k = slopeOf(s);
         c.rate = k === null ? (c.rate ? c.rate * 0.5 + r * 0.5 : r) : k > 0 ? k : (c.rate || 0) * 0.7;
         c.up = r > 300 ? c.up + 1 : 0;
-        if (r > 300 && c.rate > 300) c.rise = th;
     }
     c.sure = Math.min(c.rate, was);
     // between samples the bar moves on along the climb (or the fall); a gap over 300 ms or a jump faster than
@@ -146,6 +160,12 @@ function climbFeed(c, rpm, tMs) {
     c.move = dt > 15 && dt < 300 ? (k !== null && k > 0 ? k : r) : 0;
     if (Math.abs(c.move) > 12000) c.move = 0;
     return c;
+}
+/** A gear change: the climb before it says nothing about the one after. The rate starts afresh from the last sample. */
+function climbReset(c) {
+    if (!c || !c.s) return;
+    c.s = c.s.length ? [c.s[c.s.length - 1]] : [];
+    c.rate = 0; c.sure = 0; c.up = 0; c.step = 0;
 }
 /**
  * The rpm to draw at now (the clock climbFeed is fed with): between two samples the last one moved on along the
@@ -162,9 +182,15 @@ function shownRpm(c, rpm, now, max, ahead) {
 }
 
 // the cue's limits: the rate it reckons with (rpm/s), the lead and the count (rpm), how far under the shift point
-// the flash may come (a share of it), the count's length (s), and how long a flash under the point waits for the
-// revs to climb on (ms)
-const CUE_RATE_MAX = 8000, CUE_LEAD_MAX = 2500, CUE_SPAN_MIN = 800, CUE_SPAN_MAX = 2500, CUE_AT_MIN = 0.6, CUE_SPAN_S = 0.8, CUE_STALL_MS = 400;
+// the flash may come (a share of it), the count's length (s)
+const CUE_RATE_MAX = 8000, CUE_LEAD_MAX = 2500, CUE_SPAN_MIN = 800, CUE_SPAN_MAX = 2500, CUE_AT_MIN = 0.6, CUE_SPAN_S = 0.8;
+// a flash under the shift point stays while the revs are due at the point within the lead plus CUE_DUE_MS, and lets
+// go after CUE_MISS samples in a row that say otherwise; on at the point, it is off only CUE_HYST rpm under it
+const CUE_DUE_MS = 100, CUE_MISS = 2, CUE_HYST = 100, CUE_RISE = 100;
+// after a flash ends with a shift: no flash and no lead for CUE_DARK_MS; after a downshift no lead for
+// CUE_DOWN_MS (a blip, a kickdown); a gear number within CUE_SAME_MS of a rev drop is that same shift;
+// standing still (under CUE_STILL_KMH, when the speed is known) there is no lead
+const CUE_DARK_MS = 350, CUE_DOWN_MS = 500, CUE_SAME_MS = 1000, CUE_STILL_KMH = 5;
 /**
  * Shift cue: when the shift lights start counting and when they flash, from how fast the revs
  * climb. st = state kept between calls ({}); returns { from, at, shift, limiter, rate, fallSince }:
@@ -176,23 +202,31 @@ const CUE_RATE_MAX = 8000, CUE_LEAD_MAX = 2500, CUE_SPAN_MIN = 800, CUE_SPAN_MAX
  *            climb (from the second rising sample in a row: a lone spike moves nothing) and kept when
  *            they stop (a lift, a steady hold), so the lights then follow the revs down one step at a
  *            time instead of jumping; back to 1500 / no lead once the count is empty. Never climbed:
- *            1500 and no lead;
- *   shift  = flashing now. Held at the point it fired at, so a noisy climb rate doesn't make it
- *            flicker; it ends on a gear change (the upshift), when the revs fall 12 % under the
- *            highest they reached while flashing (an upshift without a gear signal) or have been
- *            falling for 300 ms (a lift; a traction dip is shorter). Fired early and the revs, still
- *            under the shift point, haven't climbed for 400 ms (wheelspin that stopped): it lets go
- *            and the lights count again;
+ *            1500 and no lead. No lead standing still (speed, km/h, when known: launch control, revving);
+ *   shift  = flashing now.
+ *            - Under the shift point it stays only while the revs are still due there: (shift - rpm) / rate
+ *              within the lead plus 100 ms. Two samples in a row that say otherwise (wheelspin that stopped,
+ *              a blip, falling revs) and it lets go, the lead starting again from none. Decided on samples
+ *              that came a usual step apart: a gap in them, a bunch of queued ones after the app was held
+ *              up, or frames drawn without a new one, never end a flash.
+ *            - Once the revs are on the shift point it stays, down to 100 rpm under it (a noisy hold).
+ *            - It ends on a gear change (the upshift), when the revs fall 12 % under the highest they
+ *              reached while flashing (an upshift without a gear signal), or when they have been falling
+ *              for 300 ms of samples (a lift; a traction dip is shorter).
+ *            - After a flash ended by a shift: no flash for 350 ms (300 on the glass, frame to frame), no lead until then and until the revs
+ *              rise on two samples again, and the climb rate starts afresh (the next gear's revs can land
+ *              above the old flash point). After a downshift: no lead for 500 ms;
  *   limiter= on the limiter (within 40 of the redline): everything flashes; shift points are
  *            held 150 under it, so a shift on the point never looks like the limiter;
  *   fallSince = since when the revs have been falling (ms), or null.
  * climb: the climb rate's state (climbFeed), fed elsewhere with each rpm sample; tMs is then its clock.
  * Without it the cue keeps its own (st.est), fed by these calls: for one caller on its own (previews).
- * st.fired = { t, rpm, at, lead (rpm), rate } of the last flash: what it really had (the log, the learner).
+ * A gear change resets it (climbReset). Every caller of one state must pass the same gear and shift point.
+ * st.fired = { t, rpm, at, lead (rpm), rate } of the last flash: what it fired with (the log).
  * rpmShow (optional): the rpm drawn, between samples moved on along the climb (the HUD smooths it);
  * the count, the flash and the limiter go by it, the climb rate only by the real samples (rpm).
  */
-function shiftCue(st, rpm, tMs, shift, redline, leadMs, gear, rpmShow, revFrom, climb) {
+function shiftCue(st, rpm, tMs, shift, redline, leadMs, gear, rpmShow, revFrom, climb, speed) {
     if (!isNum(rpm)) { st.on = false; st.est = null; return { from: shift - 1500, at: shift, shift: false, limiter: false, rate: 0, fallSince: null }; }
     // Shift lights as a plain rev bar (setting lightMode "rev", issue #133): an even count from revFrom to the
     // redline, the flash at the redline; no lead, no climb rate, nothing learned
@@ -202,40 +236,63 @@ function shiftCue(st, rpm, tMs, shift, redline, leadMs, gear, rpmShow, revFrom, 
         return { from: from, at: redline, shift: r >= redline, limiter: rpm >= redline - 40, rate: 0, fallSince: null };
     }
     const c = climb || climbFeed(st.est || (st.est = {}), rpm, tMs);
+    // a new sample since the last call (this state may be asked many times between two)
+    const fresh = c.n !== st.n;
+    st.n = c.n;
+    // a shift: the flash off, lead and count from none, the climb rate afresh, no lead for ms; dark after a flash
+    const rest = (ms) => { if (st.on) st.dark = tMs + CUE_DARK_MS; st.on = false; st.top = false; st.miss = 0; st.span = 0; st.lead = 0; climbReset(c); st.endT = tMs; st.hold = tMs + ms; };
+    // a new gear (the upshift itself) ends the flash and starts the next gear's count afresh: in the
+    // upper gears an upshift drops the revs only ~20 %, then they climb again at once, so neither
+    // the drop nor a lift would end it. (A gear number that comes just after the rev drop ended the
+    // flash is the same upshift: nothing more to do.)
+    const changed = typeof gear === 'number' && typeof st.gear === 'number' && gear !== st.gear;
+    const down = changed && gear < st.gear;
+    if (typeof gear === 'number') st.gear = gear;
+    if (changed && (down || !(isNum(st.endT) && tMs - st.endT < CUE_SAME_MS))) rest(down ? CUE_DOWN_MS : CUE_DARK_MS);
     const rate = c.rate || 0, climbing = rate > 300;
+    const still = isNum(speed) && speed < CUE_STILL_KMH;
     // span and lead while the revs really rise: the rate decays over a hold or a lift, and following it
     // would shrink the count while the rpm stands still
-    if (climbing && c.up >= 2 && c.sure > 300) {
+    // (not from the sample that just let a flash go: its rate is the one that was wrong)
+    // (and only on a climb of CUE_RISE rpm or more over the rate's window: sensor noise on a steady hold is less)
+    if (climbing && c.up >= 2 && c.sure > 300 && c.s[c.s.length - 1][1] - c.s[0][1] >= CUE_RISE && !(tMs < st.hold) && c.n !== st.let) {
         const k = Math.min(c.sure, CUE_RATE_MAX);
         st.span = clamp(k * CUE_SPAN_S, CUE_SPAN_MIN, CUE_SPAN_MAX);
         st.lead = Math.max(0, Math.min(CUE_LEAD_MAX, k * leadMs / 1000, shift * (1 - CUE_AT_MIN)));
+        st.block = false;
     }
+    if (still) st.lead = 0;
     const at = shift - (st.lead || 0);
     const from = at - (st.span || 1500);
     const r = isNum(rpmShow) ? rpmShow : rpm;
     if (!climbing && r <= from) { st.span = 0; st.lead = 0; }          // count empty: back to the plain span
     const fall = c.fall == null ? null : c.fall;
-    const lifted = fall !== null && tMs - fall >= 300;
-    // a new gear (the upshift itself) ends the flash and starts the next gear's count afresh: in the
-    // upper gears an upshift drops the revs only ~20 %, then they climb again at once, so neither
-    // the drop nor a lift would end it
-    const changed = typeof gear === 'number' && typeof st.gear === 'number' && gear !== st.gear;
-    if (typeof gear === 'number') st.gear = gear;
-    if (changed) { st.on = false; st.span = 0; st.lead = 0; }
-    // latch: the flash point is held from the moment it fires
-    // without a gear signal: the revs 12 % under the highest they reached while flashing (an upshift
-    // drops 18 % or more on an 8-speed, from wherever it was made; a traction dip less)
+    // a lift: falling for 300 ms of samples (not of time without any)
+    const lifted = fall !== null && c.t - fall >= 300;
     // the drop and the limiter go by the real rpm: the drawn one runs ahead along the climb
-    if (!st.on && r >= at && !lifted && !changed) {
-        st.on = true; st.at = at; st.peak = rpm;
-        st.fired = { t: tMs, rpm: r, at: at, lead: shift - at, rate: rate };
-    } else if (st.on) {
+    // due at the shift point within the lead and CUE_DUE_MS, by the slower of the rate and the last step?
+    const k = Math.min(rate, c.step || 0);
+    const due = (x) => x >= shift || (k > 0 && (shift - x) / k * 1000 <= leadMs + CUE_DUE_MS);
+    if (!st.on) {
+        // under the shift point only while due (a burst of revs that has just ended leaves a rate too high), not
+        // after a lift until the revs rise again, and nowhere just after a shift
+        if (r >= at && due(r) && !lifted && !changed && !(tMs < st.dark) && !(st.block && r < shift)) {
+            st.on = true; st.at = at; st.peak = rpm; st.top = r >= shift; st.miss = 0;
+            st.fired = { t: tMs, rpm: r, at: at, lead: shift - at, rate: rate };
+        }
+    } else {
         st.peak = Math.max(st.peak || rpm, rpm);
-        if (rpm < st.peak * 0.88 || lifted) st.on = false;
-        // fired early, and the revs never came on to the shift point: let go, the lead starts again
-        else if (st.peak < shift && r < shift && isNum(c.rise) && tMs - c.rise >= CUE_STALL_MS) { st.on = false; st.lead = 0; }
+        if (rpm >= shift) st.top = true; else if (rpm < shift - CUE_HYST) st.top = false;
+        // without a gear signal: the revs 12 % under the highest they reached while flashing (an upshift
+        // drops 18 % or more on an 8-speed, from wherever it was made; a traction dip less)
+        if (rpm < st.peak * 0.88) rest(CUE_DARK_MS);
+        else if (lifted) { st.on = false; st.top = false; st.block = true; }
+        else if (fresh && !st.top && c.even !== false) {
+            if (due(rpm)) st.miss = 0;
+            else if (++st.miss >= CUE_MISS) { st.on = false; st.miss = 0; st.lead = 0; st.let = c.n; }
+        }
     }
-    return { from: from, at: st.on ? st.at : at, shift: st.on, limiter: rpm >= redline - 40, rate: rate, fallSince: fall };
+    return { from: from, at: st.on ? st.at : at, shift: !!st.on, limiter: rpm >= redline - 40, rate: rate, fallSince: fall };
 }
 
 const numOf = (settings, k, d) => { const v = Number(settings.get(k)); return isFinite(v) ? v : d; };
@@ -243,14 +300,22 @@ const numOf = (settings, k, d) => { const v = Number(settings.get(k)); return is
 const revOf = (settings) => (settings.get('lightMode') === 'rev' ? numOf(settings, 'lightStart', 4000) : null);
 
 // the reaction lead (ms): the driver's reaction and the display's delay in one number; learned within these
-const LEAD_DEFAULT = 300, LEAD_MIN = 100, LEAD_MAX = 800;
+const LEAD_DEFAULT = 300, LEAD_MIN = 200, LEAD_MAX = 800;
+// what a shift made on the flash takes: under REACT_MIN nobody reacts (the shift wasn't made on the flash), over
+// REACT_MAX the lights weren't followed
+const REACT_MIN = 200, REACT_MAX = 1000;
+// a shift whose revs peaked this near the redline was made on the limiter, not on the lights (samples seldom
+// catch the top itself; shift points are held 150 under the redline)
+const LIMITER_NEAR = 100;
 /**
- * The lead that would have put one hand upshift on the shift point: flash = { rate (rpm/s at the flash), target
- * (the shift point), leadRpm (how far under it the flash really showed) }, rpm: where the shift came. The lead the
- * flash really had (leadRpm at that rate) plus how late the shift was, 100..800 ms.
+ * The lead one hand upshift asks for, measured in time: from the first frame that showed the flash (flash.t) to
+ * the moment the revs fell for the shift (flash.fall: the last sample before the fall, which arrived a little after
+ * it was taken). null when it says nothing: under 200 ms or over 1000 ms.
  */
-function reactionMs(flash, rpm) {
-    return clamp((flash.leadRpm + rpm - flash.target) / flash.rate * 1000, LEAD_MIN, LEAD_MAX);
+function reactionMs(flash) {
+    if (!flash || !isNum(flash.t) || !isNum(flash.fall)) return null;
+    const ms = flash.fall - flash.t;
+    return ms >= REACT_MIN && ms <= REACT_MAX ? ms : null;
 }
 
 /** Where the tach image shows in the HUD's scene (800x480), from the size and position settings. */
@@ -789,8 +854,8 @@ function start(ctx, src) {
     let lastDemo = null, wasShift = false, lastCue = null, ratesLogged = -Infinity;
     /*
      * Reaction lead, learned ("Shift lights early by" on Auto): the driver's reaction and the display's delay
-     * in one number. Each hand upshift after a flash says what lead would have put it on the shift point
-     * (reactionMs); the lead moves 30 % of the way there, within 100..800 ms; kept in data/hudlead.json.
+     * in one number. Each hand upshift after a flash says how long it took from the flash shown to the revs
+     * falling (reactionMs); the lead moves 30 % of the way there, within 200..800 ms; kept in data/hudlead.json.
      */
     const leadFile = path.join(ctx.dataDir || '.', 'hudlead.json');
     let learnedLead = LEAD_DEFAULT, leadShifts = 0, flashInfo = null;
@@ -978,7 +1043,7 @@ function start(ctx, src) {
         // drawn between samples moved on along the climb; the flash goes by where the revs will be half a frame
         // on, so it comes as often early as late against the frames (not the rev bar's: it goes by the revs drawn)
         const show = shownRpm(climb, d.rpm, tm, max);
-        const cue = shiftCue(cueState, d.rpm, tm, sp.rpm, redline, lead, d.gear, isNum(o.rev) ? show : shownRpm(climb, d.rpm, tm, max, 500 / fps()), o.rev, climb);
+        const cue = shiftCue(cueState, d.rpm, tm, sp.rpm, redline, lead, d.gear, isNum(o.rev) ? show : shownRpm(climb, d.rpm, tm, max, 500 / fps()), o.rev, climb, d.speed);
         lastCue = cue;
         if (flashInfo && tm - flashInfo.t > FLASH_WAIT_MS) { flashLine(flashInfo, null); flashInfo = null; }
         // each flash as this frame shows it: the rate and the lead the cue fired with (st.fired; the rev bar's
@@ -987,12 +1052,18 @@ function start(ctx, src) {
         if (cue.shift && !wasShift && !d.demo) {
             const rev = isNum(o.rev), fd = !rev && cueState.fired ? cueState.fired : null, point = rev ? redline : sp.rpm;
             flashInfo = { t: tm, gear: d.gear, rate: fd ? fd.rate : climb.rate || 0, target: point, lead: rev ? 0 : lead, leadSet: fd ? fd.lead : 0, fired: show,
-                leadRpm: point - show, rev: rev, style: o.style, seen: !!(lights && target && target.state === 'shown'), fall: null };
+                rev: rev, style: o.style, seen: !!(lights && target && target.state === 'shown'), fall0: null, fall: null, lim: false };
         }
         wasShift = cue.shift;
-        // first moment the revs fell after the flash: a real upshift reports its new gear within
-        // ~0.7 s of that; later, the driver lifted first and the shift says nothing about reaction
-        if (flashInfo && flashInfo.fall === null && cue.fallSince !== null) flashInfo.fall = cue.fallSince;
+        // when the revs fell after the flash. The first time (fall0): a real upshift reports its new gear within
+        // ~0.7 s of that; later, the driver lifted first and the shift says nothing about reaction. The last
+        // time (fall): the upshift itself, for the reaction's time (a traction dip before it doesn't count)
+        if (flashInfo && cue.fallSince !== null && cue.fallSince > flashInfo.t) {
+            if (flashInfo.fall0 === null) flashInfo.fall0 = cue.fallSince;
+            flashInfo.fall = cue.fallSince;
+        }
+        // on the limiter after the flash: that shift wasn't made on the lights
+        if (flashInfo && cue.limiter) flashInfo.lim = true;
         blink = cue.shift || cue.limiter ? Math.floor(now / BLINK_MS) % 2 === 0 : true;
         const gb = src.gearbox ? src.gearbox.value() : null;
         const mode = src.mode ? src.mode() : null;
@@ -1039,9 +1110,10 @@ function start(ctx, src) {
         if (now - flashLogged < FLASH_LOG_MS) return;
         flashLogged = now;
         const R = Math.round, late = isNum(rpm) && f.rate >= 300 ? (rpm - f.target) / f.rate * 1000 : null;
+        const took = isNum(rpm) && isNum(f.fall) ? f.fall - f.t : null;
         say('hud: flash g' + (isNum(f.gear) ? f.gear : '?') + ' ' + R(f.rate) + ' rpm/s, lead ' + R(f.lead) + ' ms / ' + R(f.leadSet) + ' rpm, point ' + R(f.target) +
             ', fired ' + R(f.fired) + ', ' + (f.rev ? 'rev' : 'shift') + ', ' + f.style + (f.seen ? '' : ', not shown') +
-            (isNum(rpm) ? '; upshift ' + R(rpm) + (late === null ? '' : ' (' + R(Math.abs(late)) + (late >= 0 ? ' ms late)' : ' ms early)')) : '; no upshift') +
+            (isNum(rpm) ? '; upshift ' + R(rpm) + (late === null ? '' : ' (' + R(Math.abs(late)) + (late >= 0 ? ' ms late)' : ' ms early)')) + (took === null ? '' : ', ' + R(took) + ' ms after the flash') : '; no upshift') +
             (learned ? ', lead now ' + learnedLead + ' ms after ' + leadShifts + ' shifts' : ''));
     }
 
@@ -1364,8 +1436,8 @@ function start(ctx, src) {
     apply();
 
     /**
-     * An upshift at rpm (its peak): the flash before it is logged with it, and on a climb it teaches the
-     * reaction lead (learn false: logged only).
+     * An upshift at rpm (its peak): the flash before it is logged with it, and it teaches the reaction lead
+     * (learn false: logged only).
      */
     const upshift = safe('upshift', (rpm, learn) => {
         const f = flashInfo, now = monoMs();
@@ -1373,11 +1445,17 @@ function start(ctx, src) {
         if (!f || !isNum(rpm) || now - f.t > FLASH_WAIT_MS) return;
         // in D or S the gearbox picks the moment: only shifts made by hand (M) say anything about you
         const m = src.mode ? src.mode() : null;
-        // not from a shift after a lift (the revs fell over 700 ms before it), a flash not seen or the rev bar's
-        const lifted = f.fall !== null && now - f.fall > 700;
-        if (learn === false || !f.seen || f.rev || f.rate < 300 || lifted || m === 'D' || m === 'S') { flashLine(f, rpm); return; }
+        // the revs fell over 700 ms before the shift: lifted first
+        const lifted = f.fall0 !== null && now - f.fall0 > 700;
+        // the gear came before the revs fell: the shift is now
+        if (f.fall === null) f.fall = f.fall0 = now;
+        // how long from the flash shown to the shift; not from a shift on the limiter (the lights weren't what
+        // made it), nor when the revs dipped in between (the limiter's cut, traction), nor one too quick or too
+        // slow to have been made on the flash
+        const took = f.lim || rpm >= src.redline() - LIMITER_NEAR || f.fall0 !== f.fall ? null : reactionMs(f);
+        if (learn === false || !f.seen || f.rev || lifted || m === 'D' || m === 'S' || took === null) { flashLine(f, rpm); return; }
         const before = learnedLead;
-        learnedLead = Math.round(clamp(learnedLead + (reactionMs(f, rpm) - learnedLead) * 0.3, LEAD_MIN, LEAD_MAX) / 10) * 10;
+        learnedLead = Math.round(clamp(learnedLead + (took - learnedLead) * 0.3, LEAD_MIN, LEAD_MAX) / 10) * 10;
         leadShifts++;
         flashLine(f, rpm, true);
         // written only when the lead moves (once settled, seldom)
@@ -1404,7 +1482,7 @@ function start(ctx, src) {
     }
 
     // frame: one frame's data without drawing (for tests)
-    /** The learned reaction time for the Learned page: { ms, shifts, auto } (auto: the setting is on Auto). */
+    /** The learned reaction lead for the Learned page: { ms, shifts, auto } (auto: the setting is on Auto). */
     function learned() { return { ms: leadMs(), shifts: leadShifts, auto: num('hudLead', -1) < 0 }; }
     /** Forget the learned reaction lead (back to LEAD_DEFAULT). */
     function resetLead() {
@@ -1429,4 +1507,4 @@ function start(ctx, src) {
 }
 
 // writeAtomic: kept here too (it moved to files.js in 2.0) for code that calls Hud.writeAtomic
-module.exports = { start, revOf, writeAtomic, navPlaceOf, BMW_SPEED, GLASS, optsFrom, PROFILE_KEYS, SETUPS, profileOf, comfortMode, setupMode, profileView, setComfortMode, setSetupMode, migrateProfiles, reactionMs, gearFontOf, M_STYLES, placeOf, outsideGlass, readoutsFor, rpmItem, electricalItems, electricalWants, MAX_READOUTS, METER_STYLES, driveModeOf, calmFor, calmOpts, demoAt, DEMO_MS, demoFrame, shiftCue, climbFeed, shownRpm, monoMs, LEAD_DEFAULT, drawDown };
+module.exports = { start, revOf, writeAtomic, navPlaceOf, BMW_SPEED, GLASS, optsFrom, PROFILE_KEYS, SETUPS, profileOf, comfortMode, setupMode, profileView, setComfortMode, setSetupMode, migrateProfiles, reactionMs, gearFontOf, M_STYLES, placeOf, outsideGlass, readoutsFor, rpmItem, electricalItems, electricalWants, MAX_READOUTS, METER_STYLES, driveModeOf, calmFor, calmOpts, demoAt, DEMO_MS, demoFrame, shiftCue, climbFeed, climbReset, shownRpm, monoMs, LEAD_DEFAULT, drawDown };

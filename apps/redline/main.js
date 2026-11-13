@@ -322,8 +322,16 @@ mgu.run({
             shareShift(true);
         }
 
-        /** The shift cue now (the screen's and the HUD's are one): d = the car's data, tm = Hud.monoMs(). */
-        const cueNow = (d, tm) => Hud.shiftCue(cueState, d.rpm, tm, shiftPoint(d.oil, d.gear).rpm, redline(), hud ? hud.lead() : Hud.LEAD_DEFAULT, d.gear, undefined, Hud.revOf(settings), climb);
+        /**
+         * The shift cue now (the screen's and the HUD's are one), tm = Hud.monoMs(). Always from car.data(), as the
+         * HUD's frames: a sample's own data has no gear on a car without a gear signal, where car.data() has the
+         * guessed one, and two gears are two shift points into one cue.
+         */
+        const cueNow = (tm) => {
+            const d = car.data();
+            return Hud.shiftCue(cueState, d.rpm, tm, shiftPoint(d.oil, d.gear).rpm, redline(), hud ? hud.lead() : Hud.LEAD_DEFAULT, d.gear, undefined, Hud.revOf(settings), climb, d.speed);
+        };
+        let ambientAt = -Infinity;
         car.onSample((d, t) => {
             // the cue's clock: when the sample arrived, on a clock that never jumps (t is the wall clock, set from GPS)
             const tm = Hud.monoMs(), seen = climb.n;
@@ -333,9 +341,9 @@ mgu.run({
             while (recent.length && t - recent[0][0] > 1200) recent.shift();
             // the screen's shift cue, the HUD's own (count-in by climb rate, early flash, lift handling),
             // updated on each sample so a fast screen doesn't see repeated readings
-            screenCue = cueNow(d, tm);
-            // the moment the cue flashes: the ambient light flashes red too (real drives only)
-            if (screenCue.shift && !cueShift && !car.data().demo) Hud.writeAtomic(AMBIENT_FLASH, JSON.stringify({ rgb: [255, 0, 0], ms: 1200 }) + '\n');
+            screenCue = cueNow(tm);
+            // the moment the cue flashes: the ambient light flashes red too (real drives only; once per flash of its own)
+            if (screenCue.shift && !cueShift && !car.data().demo && tm - ambientAt > 1500) { ambientAt = tm; Hud.writeAtomic(AMBIENT_FLASH, JSON.stringify({ rgb: [255, 0, 0], ms: 1200 }) + '\n'); }
             cueShift = !!screenCue.shift;
             // slowing (for the downshift cue): braking, down at least 6 km/h per second (~0.17 g) over
             // the last 0.5 s; coasting off the throttle stays under it
@@ -464,7 +472,7 @@ mgu.run({
             const rpm = d.rpm;
             // the cue as it stands now (the HUD may have flashed since the last sample: the screen flashes with
             // it); before any sample, the plain shift point
-            const cue = screenCue && G.isNum(rpm) ? cueNow(d, Hud.monoMs()) : Hud.shiftCue({}, rpm, now, sp.rpm, redline(), 0, undefined, undefined, Hud.revOf(settings));
+            const cue = screenCue && G.isNum(rpm) ? cueNow(Hud.monoMs()) : Hud.shiftCue({}, rpm, now, sp.rpm, redline(), 0, undefined, undefined, Hud.revOf(settings));
             const shiftNow = G.isNum(rpm) && cue.shift;
             // setting "flash" on: lights, gear and SHIFT blink (GPU renderer: 8 Hz clock phase;
             // software, few fps: alternate every frame) and the screen flashes red. Off: they

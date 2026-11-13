@@ -440,7 +440,10 @@ The 12 lights are a **shift** light, not a rev scale:
   alike: the slope over the samples of the last 250 ms (least squares; `climbFeed` in `hud.js`),
   timed on a clock that never jumps. Samples arrive some ms early or late, so each one's time is
   drawn towards the last one plus the usual step. The lead and the count take the rate two samples
-  in a row agree on, from the second rising sample on: one spiky reading moves nothing.
+  in a row agree on, from the second rising sample on and only on a climb of 100 rpm or more over
+  those 250 ms: one spiky reading, or sensor noise on a steady hold, moves nothing. Standing
+  still (speed under 5 km/h) there is no lead: launch control or revving flashes at the shift
+  point only.
 - **On time.** While the lights count or flash, the HUD draws each new rpm sample at once instead
   of at its next frame (never more than 30 frames a second), and the flash goes by where the revs
   will be half a frame on.
@@ -449,8 +452,19 @@ The 12 lights are a **shift** light, not a rev scale:
   - Without a gear signal, a drop of 12 % from the highest rpm while flashing ends it. An upshift
     drops 18 % or more on an 8-speed; a traction dip drops less.
   - Revs falling for 300 ms (a lift) also end it.
-  - A flash that fired early lets go when the revs, still under the shift point, haven't climbed
-    for 400 ms (wheelspin that stopped): the lights count again, and the lead starts from none.
+  - **Under the shift point** the flash stays only while the revs are still due there: the time
+    to the shift point at the rate they climb now, (shift point − rpm) ÷ rate, within the lead
+    plus 100 ms. Two samples in a row that say otherwise and it lets go, the lead starting again
+    from none: wheelspin that stopped, a throttle blip, falling revs. It also only comes on while
+    due by the last sample's own step. This is decided on samples that came a usual step apart:
+    a gap in them, a bunch at once after the app was held up, or frames drawn without a new one,
+    never end a flash. A burst of revs can still flash for as long as it
+    lasts, and a pull that follows it at once can flash up to about 250 ms too early.
+  - **On the shift point** it stays, down to 100 rpm under it, so a noisy hold doesn't flicker.
+  - **After a shift ended a flash** the lights stay out of flash for 350 ms and the climb rate
+    starts afresh: the next gear's revs can land above the old flash point, and at 5 Hz a shorter
+    break would read as one long flash. A gear number that comes within a second of the rev drop
+    is the same shift. After a downshift (a blip, a kickdown) there is no lead for 500 ms.
 - **Lifting or holding.**
   - Lift before the shift point and the lights step back down one at a time.
   - Hold a steady rpm below the shift point and the count stays steady.
@@ -526,11 +540,16 @@ log lists the raw values (`gearbox programme: …`), so the detection can be che
 
 One number: your reaction time plus the display's delay. With *Shift lights early by* on **Auto**
 it starts at 300 ms, and each upshift after a flash you could see (HUD shown, lights on) says what
-it should have been: the lead the flash really had (from the rpm it showed at to the shift point,
-÷ the climb rate) plus how late the shift came ((shift rpm − shift point) ÷ climb rate). The lead
-then moves 30 % of the way there, within 100–800 ms (one learned under 100 ms before 2.0.40 reads
-as 100). A shift that comes more than 700 ms after the revs started falling (you lifted first) is
-not used, nor is one in D or S.
+it should have been, measured in time: from the first frame that showed the flash to the moment
+the revs fell for the shift. The lead then moves 30 % of the way there, within 200–800 ms (one
+learned under 200 ms before 2.0.40 reads as 200). Not used:
+
+- a shift in D or S;
+- one that comes more than 700 ms after the revs started falling (you lifted first), or with a dip
+  of the revs between the flash and the shift (traction, the limiter's cut);
+- one whose revs peaked within 100 rpm of the redline: it was made on the limiter, not the lights;
+- one under 200 ms after the flash (nobody reacts that fast: it wasn't made on the flash, as when
+  you always shift early) or over 1000 ms (the lights weren't followed).
 
 ## Downshift cue
 
@@ -762,12 +781,13 @@ Useful lines:
 - `hud: route without readable turns, BMW's directions shown` / `hud: own directions`: Redline leaving the HUD
   to BMW's card and coming back.
 - `hud: rpm samples every N ms`: how often the car sends rpm.
-- `hud: flash g2 5200 rpm/s, lead 300 ms / 1560 rpm, point 6500, fired 4940, shift, ramp; upshift 6480 (4 ms early), lead now 300 ms after 12 shifts`:
+- `hud: flash g2 5200 rpm/s, lead 300 ms / 1560 rpm, point 6500, fired 4940, shift, ramp; upshift 6480 (4 ms early), 296 ms after the flash, lead now 300 ms after 12 shifts`:
   one flash of the shift lights and what came of it, written at the upshift (or `no upshift` after 2 s), at most
   one every 5 s. The gear, the climb rate, the lead asked for and the rpm it made, the shift point, the rpm
   the HUD showed when it first flashed, the lights' mode (`shift`, or `rev` for the rev bar: its point is the
   redline), the layout, `not shown` when the lights were off or the HUD wasn't showing; then the rpm of the
-  upshift and how early or late it was against the point, and the reaction lead when this shift taught it.
+  upshift, how early or late it was against the point, how long after the flash was first shown the revs fell
+  for it, and the reaction lead when this shift taught it.
   Fired at or over the point on a fast climb means the lights were late.
 - `hud: 1 min: 1150 frames drawn, 1090 sent, 520 KB, ticks late 1.2 / 38.0 ms, draw 3.4 / 11.2 ms, socket blocked 0, rpm every 66 +- 9 ms`:
   once a minute while the tach draws (100 frames or more in it). Frames drawn and sent to cluster-render and
