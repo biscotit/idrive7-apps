@@ -425,17 +425,32 @@ glass's edge. Checked for every size and position the settings allow.
 
 The 12 lights are a **shift** light, not a rev scale:
 
-- **Count-in.** The lights fill over about the last second before the shift. The rpm span comes
-  from how fast the revs climb (800–2000 rpm), so the count takes about as long in 2nd as in 5th.
+- **Count-in.** The lights fill over about the last 0.8 s before the flash. The rpm span is what the
+  revs climb in that time (800–2500 rpm), so the count takes about as long in 2nd as in 5th. Above
+  about 3000 rpm/s the 2500 rpm are less than 0.8 s (0.6 s at 4000 rpm/s).
   In GT3 style the pairs light from both ends inwards: green, yellow, red.
-- **Early flash.** All lights flash, by the clock at 5 Hz, early by your reaction time × the climb
-  rate (at most 800 rpm), so that your shift lands on the shift point. *Shift lights early by*
-  sets the reaction time; *Auto* learns it.
+- **Early flash.** All lights flash, by the clock at 5 Hz, early by the lead × the climb rate, so
+  that your shift lands on the shift point. The lead is your reaction time and the display's delay
+  in one number: *Shift lights early by* sets it (0–800 ms); *Auto* learns it, starting at 300 ms.
+  Limits, so a wrong reading can't flash far too early: the climb rate counts up to 8000 rpm/s, the
+  lead is at most 2500 rpm, and the flash never comes under 60 % of the shift point. (Until 2.0.39
+  the lead was at most 800 rpm: from about 4000 rpm/s the flash came 0–150 ms before the shift
+  point whatever the setting, and the redline came first.)
+- **The climb rate** is measured once, as each rpm sample arrives, for the screen and the HUD
+  alike: the slope over the samples of the last 250 ms (least squares; `climbFeed` in `hud.js`),
+  timed on a clock that never jumps. Samples arrive some ms early or late, so each one's time is
+  drawn towards the last one plus the usual step. The lead and the count take the rate two samples
+  in a row agree on, from the second rising sample on: one spiky reading moves nothing.
+- **On time.** While the lights count or flash, the HUD draws each new rpm sample at once instead
+  of at its next frame (never more than 30 frames a second), and the flash goes by where the revs
+  will be half a frame on.
 - **Ending the flash.**
   - A gear change ends it, and the next gear counts in afresh.
   - Without a gear signal, a drop of 12 % from the highest rpm while flashing ends it. An upshift
     drops 18 % or more on an 8-speed; a traction dip drops less.
   - Revs falling for 300 ms (a lift) also end it.
+  - A flash that fired early lets go when the revs, still under the shift point, haven't climbed
+    for 400 ms (wheelspin that stopped): the lights count again, and the lead starts from none.
 - **Lifting or holding.**
   - Lift before the shift point and the lights step back down one at a time.
   - Hold a steady rpm below the shift point and the count stays steady.
@@ -443,7 +458,7 @@ The 12 lights are a **shift** light, not a rev scale:
 - **Limiter.** Within 40 rpm of the redline, the bar, the lights and the gear all flash red.
 
 The yellow mark is the shift point itself. The flash comes before it on purpose: in 1st, the revs
-climb about 3000 rpm/s, so a 240 ms reaction means a flash about 700 rpm early.
+climb about 4000 rpm/s, so a 300 ms lead means a flash about 1200 rpm early.
 
 **Rev bar instead** (Settings → Shift point → *Shift lights*: *Rev bar*, issue #133): the lights are a
 plain rev scale. They fill evenly from *From* (4,000 rpm by default) to the redline, the same in every
@@ -509,12 +524,13 @@ log lists the raw values (`gearbox programme: …`), so the detection can be che
 
 ### Reaction time
 
-With *Shift lights early by* on **Auto**, each upshift after a flash you could see (HUD shown,
-lights on) checks how late it came: (shift rpm − shift point) ÷ climb rate. The lead then moves
-30 % of the way to what would have hit the point, within 0–600 ms. On a fast climb the flash can
-come at most 800 rpm early, so the lead it really had is used (not the one asked for); otherwise
-quick shifts in 1st and 2nd would push the lead up and make higher gears flash too early. A shift that
-comes more than 700 ms after the revs started falling (you lifted first) is not used.
+One number: your reaction time plus the display's delay. With *Shift lights early by* on **Auto**
+it starts at 300 ms, and each upshift after a flash you could see (HUD shown, lights on) says what
+it should have been: the lead the flash really had (from the rpm it showed at to the shift point,
+÷ the climb rate) plus how late the shift came ((shift rpm − shift point) ÷ climb rate). The lead
+then moves 30 % of the way there, within 100–800 ms (one learned under 100 ms before 2.0.40 reads
+as 100). A shift that comes more than 700 ms after the revs started falling (you lifted first) is
+not used, nor is one in D or S.
 
 ## Downshift cue
 
@@ -661,7 +677,7 @@ Everything lives in the app's `data/` folder on the head unit
 
 | File | What | Size | Written |
 |---|---|---|---|
-| `redline.log`, `redline.log.1` | the app's log: at 256 KB it is renamed to `.1` over the older one | ≤ ~512 KB | on events, never per frame; the same kind of line at most every 10 min (`quietlog.js`) |
+| `redline.log`, `redline.log.1` | the app's log: at 256 KB it is renamed to `.1` over the older one | ≤ ~512 KB | on events, never per frame; the same kind of line at most every 10 min (`quietlog.js`), but for the HUD's flash line (at most every 5 s) and its line a minute |
 | `redline-nav.log`, `redline-nav.log.1` | the navigation probe: the same, at 256 KB | ≤ ~512 KB | only while the HUD shows directions (and 10 s after) |
 | `redline-power.log`, `redline-power.log.1` | the car's own power meter and fuel-use displays, raw, with Redline's kW, l/h and speed beside them (to learn their scales) | ≤ ~512 KB | only while *Fuel* or the power bar is on, each value at most every 3 s, the first 30 min after each start |
 | `settings.json` | settings | small | when a setting changes |
@@ -673,8 +689,9 @@ Everything lives in the app's `data/` folder on the head unit
 
 Both logs keep at most two files, so Redline's logs never take more than about 1 MB: the oldest lines are
 dropped as new ones come. A line that would repeat (a unit not answering, knock, a low tyre, a plateau on the
-limiter) is written once, then again at most every 10 minutes with how many were held back (`(+12 like it)`);
-each shift is not logged at all.
+limiter) is written once, then again at most every 10 minutes with how many were held back (`(+12 like it)`).
+Two kinds of line keep their own limits instead, to check the shift lights' timing from a car (below): one per
+flash, at most every 5 s, and one a minute while the HUD draws (about 10 KB an hour of driving).
 
 Learned files are written to a temp file and renamed, so a power cut can't corrupt them. On
 load they are range-checked; a bad file is ignored and relearned.
@@ -745,9 +762,21 @@ Useful lines:
 - `hud: route without readable turns, BMW's directions shown` / `hud: own directions`: Redline leaving the HUD
   to BMW's card and coming back.
 - `hud: rpm samples every N ms`: how often the car sends rpm.
+- `hud: flash g2 5200 rpm/s, lead 300 ms / 1560 rpm, point 6500, fired 4940, shift, ramp; upshift 6480 (4 ms early), lead now 300 ms after 12 shifts`:
+  one flash of the shift lights and what came of it, written at the upshift (or `no upshift` after 2 s), at most
+  one every 5 s. The gear, the climb rate, the lead asked for and the rpm it made, the shift point, the rpm
+  the HUD showed when it first flashed, the lights' mode (`shift`, or `rev` for the rev bar: its point is the
+  redline), the layout, `not shown` when the lights were off or the HUD wasn't showing; then the rpm of the
+  upshift and how early or late it was against the point, and the reaction lead when this shift taught it.
+  Fired at or over the point on a fast climb means the lights were late.
+- `hud: 1 min: 1150 frames drawn, 1090 sent, 520 KB, ticks late 1.2 / 38.0 ms, draw 3.4 / 11.2 ms, socket blocked 0, rpm every 66 +- 9 ms`:
+  once a minute while the tach draws (100 frames or more in it). Frames drawn and sent to cluster-render and
+  their size; how late the frame timer ran against its interval, average / worst (the head unit's event loop
+  held up); the time to draw a frame, find what changed and pack it, average / worst; how many frames met a
+  socket that wasn't taking data (cluster-render behind); the usual time between rpm samples and how far their
+  arrivals usually are off it.
 - `limiter: learned …`
 - `shiftmap: 3>4 at 5550`
-- `hud: shift at … (N ms late), reaction lead now …`
 - `gearbox: EGS 6000 = … C`
 - `electrical: 12 V from 18:OBD 42`, `electrical: high-voltage battery found (…)`
 - `tyres: the car sends tyre pressures: …`, `tyres: car units: …`, `tyres: raw pressure [...]`, `hud: low tyre RR: …`
@@ -757,7 +786,7 @@ Useful lines:
 | File | What |
 |---|---|
 | `main.js` | The app: the screen pages, settings, scoring, and the wiring of everything below |
-| `hud.js` | The HUD layer: connect, pace, smooth the rpm, decide what to show (readouts, grade, peak), send; `shiftCue()` (shared with the screen); the test pattern |
+| `hud.js` | The HUD layer: connect, pace, smooth the rpm, decide what to show (readouts, grade, peak), send; `climbFeed()` and `shiftCue()` (the climb rate and the cue, shared with the screen); the test pattern |
 | `hud-draw.js` | Drawing the HUD image: the six layouts, the palettes, 7-segment digits, lights, bar and bar graph, readouts, grade burst, shake, downshift arrows; the cached static layer |
 | `hud-theme.js` | What the HUD drawing files share: the grade colours, the grade burst's timing, label fitting |
 | `nav.js` | Directions, the data: decodes the route events, `conclusiveDart` and the lanes into the next turn; freshness (3 s) and giving way to BMW's card |
@@ -777,10 +806,12 @@ Useful lines:
 | `cluster_render_client.js` | Vendored unchanged from robertnisipeanu/idrive-apps `native/cluster-render/js` (MPL-2.0) |
 
 **Flow.** Car samples (about 10–20 a second) go to `main.js` `onSample`. From there they feed the
-screen's shift cue, `limiter.feed`, and `shiftMap.feed` (with fresh torque). The HUD has its own
-timer at the *Frame rate*. Each tick it reads `car.data()`, smooths the rpm between samples, runs
-its own shift cue and draws. Upshifts detected in `main.js` go to `hud.upshift()` for the reaction
-time.
+climb rate (`Hud.climbFeed`, stamped on arrival with `Hud.monoMs()`), the shift cue, `limiter.feed`,
+and `shiftMap.feed` (with fresh torque). The cue's state and the climb rate are one pair of objects
+for the screen and the HUD (`src.cue`), so both flash together. The HUD has its own timer at the
+*Frame rate*. Each tick it reads `car.data()`, moves the rpm on between samples (`shownRpm`), runs
+the same cue and draws; `hud.sampled()` draws a new sample at once while the lights count or flash.
+Upshifts detected in `main.js` go to `hud.upshift()` for the flash's log line and the reaction lead.
 
 **Rules.**
 

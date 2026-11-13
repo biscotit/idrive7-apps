@@ -7,7 +7,9 @@
 //   './cluster_render_client' to opts.clusterRender when given;
 // - fakeClusterRender(opts): a stand-in cluster-render, ready at once, recording layers, pixels, effects and status asks;
 // - claimsDir(prefix): a temp folder with the HUD claims folder in it (MGU_HUD_CLAIMS), rmTree(p) to remove a folder;
-// - redlineDefaults(): Redline's app.json and its settings' defaults.
+// - redlineDefaults(): Redline's app.json and its settings' defaults;
+// - prng(seed): a seeded random number generator (the tests never use Math.random);
+// - cueRun(Hud, o): the shift cue driven as the app drives it, from samples that arrive with jitter.
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -90,4 +92,63 @@ function redlineDefaults() {
     return { spec: spec, def: def };
 }
 
-module.exports = { ROOT, counter, sleep, hookKit, fakeClusterRender, claimsDir, rmTree, redlineDefaults };
+/** rand() in 0..1 from a seed (mulberry32): the same numbers on every run and every Node. */
+function prng(seed) {
+    let a = seed >>> 0;
+    return function () {
+        a = (a + 0x6D2B79F5) >>> 0;
+        let t = a;
+        t = Math.imul(t ^ (t >>> 15), t | 1);
+        t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+}
+
+/**
+ * The shift cue as the app runs it (main.js onSample, hud.js frameData and its pacing), on a made-up clock.
+ * o = { rpmAt(tMs) (the true revs), gearAt(tMs) (optional), period (ms between rpm samples), jitter (+- ms on each
+ * sample's arrival), seed, frame (ms between the HUD's frames, 50), lead (ms), shift, redline, rev (the rev bar's
+ * start, optional), until (ms), own (true: the HUD keeps its own cue state, fed by the same climb rate) }.
+ * The reading taken at k * period arrives at k * period + jitter: there the climb rate is fed and the screen's cue
+ * run; the HUD's cue runs at each frame, and at once on a sample while the lights count or flash (never two frames
+ * within 33 ms). Returns { ev: [{ t, kind ('s' sample, 'f' frame), rpm, show, screen, hud }], flashAt (the HUD's
+ * first flash, ms), countAt (its first frame with the revs in the count), climb, st }. ev.screen: the screen's cue
+ * at that moment (drawn from the same state as the HUD's; with own, its cue from the sample), hud: the HUD's when
+ * it drew.
+ */
+function cueRun(Hud, o) {
+    const rand = prng(o.seed || 1), frame = o.frame || 50, gap = 1000 / 30;
+    const climb = {}, st = {}, stHud = o.own ? {} : st, ev = [];
+    const max = o.redline - 50, gearAt = o.gearAt || (() => 3);
+    const arrivals = [];
+    for (let k = 0; k * o.period <= o.until; k++) arrivals.push({ t: Math.max(0, k * o.period + (rand() * 2 - 1) * (o.jitter || 0)), rpm: Math.round(o.rpmAt(k * o.period) * 4) / 4, gear: gearAt(k * o.period) });
+    arrivals.sort((x, y) => x.t - y.t);
+    let rpm = null, gear, last = null, drawnAt = -Infinity, bySample = false, flashAt = null, countAt = null, i = 0;
+    const draw = (t, kind, screen) => {
+        const show = Hud.shownRpm(climb, rpm, t, max);
+        const hud = Hud.shiftCue(stHud, rpm, t, o.shift, o.redline, o.lead, gear, Hud.shownRpm(climb, rpm, t, max, frame / 2), o.rev, climb);
+        last = hud;
+        if (hud.shift && flashAt === null) flashAt = t;
+        if (!hud.shift && flashAt === null && countAt === null && show > hud.from) countAt = t;
+        // the screen draws from the same state (main.js drawTach): its cue at this moment
+        if (!o.own) screen = Hud.shiftCue(st, rpm, t, o.shift, o.redline, o.lead, gear, undefined, o.rev, climb);
+        ev.push({ t: t, kind: kind, rpm: rpm, show: show, screen: screen || null, hud: hud });
+    };
+    for (let f = 0; f * frame <= o.until; f++) {
+        const tf = f * frame;
+        while (i < arrivals.length && arrivals[i].t <= tf) {
+            const a = arrivals[i++], n = climb.n;
+            rpm = a.rpm; gear = a.gear;
+            Hud.climbFeed(climb, rpm, a.t);
+            const screen = Hud.shiftCue(st, rpm, a.t, o.shift, o.redline, o.lead, gear, undefined, o.rev, climb);
+            if (climb.n !== n && last && (last.shift || rpm > last.from) && a.t - drawnAt >= gap) { drawnAt = a.t; bySample = true; draw(a.t, 's', screen); }
+            else ev.push({ t: a.t, kind: 's', rpm: rpm, show: rpm, screen: screen, hud: null });
+        }
+        if (rpm === null || (bySample && tf - drawnAt < gap)) continue;
+        drawnAt = tf; bySample = false;
+        draw(tf, 'f');
+    }
+    return { ev: ev, flashAt: flashAt, countAt: countAt, climb: climb, st: st };
+}
+
+module.exports = { ROOT, counter, sleep, hookKit, fakeClusterRender, claimsDir, rmTree, redlineDefaults, prng, cueRun };

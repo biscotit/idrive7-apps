@@ -19,7 +19,7 @@
  *
  * Experimental parts (README.md in this folder has the whole story):
  *   hud.js       the head-up display through cluster-render, and the shift cue the HUD and this
- *                screen's lights share (count-in over ~1 s of climb, flash early by the reaction
+ *                screen's lights share (count-in over ~0.8 s of climb, flash early by the reaction
  *                time, ended by the upshift or a lift; everything flashes on the limiter)
  *   hud-draw.js  draws the HUD image: layouts (standard, minimal, split wings), palettes, readouts
  *   limiter.js   learns the real rev limit from the rpm plateau on the limiter
@@ -252,7 +252,8 @@ mgu.run({
         let shifts = [];                    // { at, from, to, rpm, target, verdict }
         const recent = [];                  // [t, rpm, speed] last ~1 s
         let lastGear = null, onLimiter = false, lastShift = null, hud = null;
-        const cueState = {};
+        // one cue and one climb rate for the screen and the HUD (hud.js shiftCue, climbFeed), so both flash together
+        const cueState = {}, climb = {};
         let screenCue = null, cueShift = false, slowingUntil = 0, lastRpmVal = null, lastRpmChange = 0;
 
         /*
@@ -314,20 +315,25 @@ mgu.run({
             const sp = shiftPoint(car.data().oil, from);
             const gm = modeNow();
             lastShift = { at: Date.now(), from, to, rpm: Math.round(rpm), target: sp.rpm, verdict: gradeOf(rpm, sp, gm), mode: gm };
-            if (hud && learning() && !car.data().demo) hud.upshift(rpm);         // never learn from the demo drive
+            if (hud && !car.data().demo) hud.upshift(rpm, learning());           // never learn from the demo drive
             shifts.unshift(lastShift);
             shifts = shifts.slice(0, 60);
             log.debug('shift ' + from + '->' + to + ' @' + lastShift.rpm + ' ' + lastShift.verdict);
             shareShift(true);
         }
 
+        /** The shift cue now (the screen's and the HUD's are one): d = the car's data, tm = Hud.monoMs(). */
+        const cueNow = (d, tm) => Hud.shiftCue(cueState, d.rpm, tm, shiftPoint(d.oil, d.gear).rpm, redline(), hud ? hud.lead() : Hud.LEAD_DEFAULT, d.gear, undefined, Hud.revOf(settings), climb);
         car.onSample((d, t) => {
-            if (!G.isNum(d.rpm)) { screenCue = null; Hud.shiftCue(cueState, null, t, 0, 0, 0); return; }
+            // the cue's clock: when the sample arrived, on a clock that never jumps (t is the wall clock, set from GPS)
+            const tm = Hud.monoMs(), seen = climb.n;
+            Hud.climbFeed(climb, d.rpm, tm);
+            if (!G.isNum(d.rpm)) { screenCue = null; Hud.shiftCue(cueState, null, tm, 0, 0, 0); return; }
             recent.push([t, d.rpm, d.speed]);
             while (recent.length && t - recent[0][0] > 1200) recent.shift();
-            // the screen's shift cue, the same as the HUD's (count-in by climb rate, early flash,
-            // lift handling), updated on each sample so a fast screen doesn't see repeated readings
-            screenCue = Hud.shiftCue(cueState, d.rpm, t, shiftPoint(d.oil, d.gear).rpm, redline(), hud ? hud.lead() : 200, d.gear, undefined, Hud.revOf(settings));
+            // the screen's shift cue, the HUD's own (count-in by climb rate, early flash, lift handling),
+            // updated on each sample so a fast screen doesn't see repeated readings
+            screenCue = cueNow(d, tm);
             // the moment the cue flashes: the ambient light flashes red too (real drives only)
             if (screenCue.shift && !cueShift && !car.data().demo) Hud.writeAtomic(AMBIENT_FLASH, JSON.stringify({ rgb: [255, 0, 0], ms: 1200 }) + '\n');
             cueShift = !!screenCue.shift;
@@ -363,7 +369,9 @@ mgu.run({
             }
             if (G.isNum(g)) lastGear = g;
             shareShift(false);
-        }, () => { recent.length = 0; lastGear = null; screenCue = null; Object.keys(cueState).forEach((k) => { delete cueState[k]; }); });
+            // a new rpm sample while the lights count or flash: the HUD draws it now, not at its next tick
+            if (hud && climb.n !== seen) hud.sampled();
+        }, () => { recent.length = 0; lastGear = null; screenCue = null; [cueState, climb].forEach((o) => Object.keys(o).forEach((k) => { delete o[k]; })); });
 
         /* ---------- rev bar geometry + static background (cached) ---------- */
         const BW = BAR.x1 - BAR.x0 - BAR.slant, BH = BAR.y1 - BAR.y0;
@@ -454,8 +462,9 @@ mgu.run({
             const sx = BAR.x0 + barX(sp.rpm);                                                   // shift point mark
             cv.fillRect(sx + BAR.slant - 2, BAR.y0 - 14, 4, 12, t.warn);
             const rpm = d.rpm;
-            // the cue from the last sample; before any sample, the plain shift point
-            const cue = screenCue || Hud.shiftCue({}, rpm, now, sp.rpm, redline(), 0, undefined, undefined, Hud.revOf(settings));
+            // the cue as it stands now (the HUD may have flashed since the last sample: the screen flashes with
+            // it); before any sample, the plain shift point
+            const cue = screenCue && G.isNum(rpm) ? cueNow(d, Hud.monoMs()) : Hud.shiftCue({}, rpm, now, sp.rpm, redline(), 0, undefined, undefined, Hud.revOf(settings));
             const shiftNow = G.isNum(rpm) && cue.shift;
             // setting "flash" on: lights, gear and SHIFT blink (GPU renderer: 8 Hz clock phase;
             // software, few fps: alternate every frame) and the screen flashes red. Off: they
@@ -594,7 +603,7 @@ mgu.run({
         const studio = { cue: {}, t0: Date.now(), panel: 'look', profile: 'sport', drawnAt: 0, readouts: 'engine' };
         const studioP = () => Hud.profileView(settings, studio.profile);
         /** The preview's frame at now: the HUD's own demo frame (hud.js demoFrame), the same as on the glass. */
-        const studioFrame = (now) => Hud.demoFrame(now - studio.t0, Hud.optsFrom(studioP()), studio.cue, hud ? hud.lead() : 200, now);
+        const studioFrame = (now) => Hud.demoFrame(now - studio.t0, Hud.optsFrom(studioP()), studio.cue, hud ? hud.lead() : Hud.LEAD_DEFAULT, now);
         /** A small still of a layout for its tile (cached per look and the settings that change it). */
         function lookLayer(style) {
             const P = studioP(), o = Hud.optsFrom(P);
@@ -1129,6 +1138,8 @@ mgu.run({
         hud = Hud.start(ctx, {
             // the next turn and lanes while a route runs (null: none here)
             nav: nav,
+            // the screen's cue and climb rate: the HUD flashes by the same
+            cue: { state: cueState, climb: climb },
             data: () => car.data(), shiftPoint, redline, maxRpm, gearbox, knock, fuel, electrical, tyres, downshift,
             // the tach's peak marker (drops back after "Peak hold"), the last upshift's grade for 1.5 s,
             // boost once it has moved and is under 2 s old (none from the demo drive)

@@ -7,6 +7,8 @@
 // - the readouts row: units, the four-item cap (a cold / hot warning keeps its place), missing data;
 // - the shift cue: counts in, flashes before the point by the lead, holds, ends on the upshift, a
 //   lift or the drop after a shift without a gear signal, and flags the limiter;
+// - 2.0.40's cue on time: from samples that arrive with jitter the flash comes the lead before the shift point at
+//   2000-8000 rpm/s, a spike or wheelspin doesn't leave it on, the screen and the HUD flash together;
 // - the scripted demo drive stays in range; settings in the code exist in app.json and vice versa;
 // - 2.0.1's tyres: Redline's own reading, the readout and its 2x2 block, the tyre widget with every part, unit and label size;
 // - 2.0's electrical readouts: a petrol / diesel car never shows the hybrid ones; electrical.js reads what eDrive reads.
@@ -173,6 +175,202 @@ ok(c.every((q) => !q.shift && !q.limiter), 'no rpm: nothing lit');
     ok(Hud.revOf(S({})) === null && Hud.revOf(S({ lightMode: 'shift', lightStart: 4500 })) === null, 'shift mode (the default): the count into the shift point as before');
     const defs = {}; spec.settings.forEach((x) => { defs[x.key] = x.default; });
     ok(Hud.optsFrom(S(Object.assign({}, defs, { lightMode: 'rev', lightStart: 3500 }))).rev === 3500 && Hud.optsFrom(S(defs)).rev === null, 'rev bar: the setting reaches the HUD');
+}
+
+/* ---------- the cue on time (2.0.40): samples arriving with jitter, the HUD's frames every 50 ms ---------- */
+{
+    // TH.cueRun drives the climb rate and the cue as the app does: rpm samples every 66 or 100 ms that arrive up to
+    // 15 ms early or late, the screen's cue per sample, the HUD's per frame and at once on a sample in the count
+    const SHIFT = 6500, RED = 7000, T0 = 1500, START = 1200, SEEDS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+    const clamp = (x, a, b) => Math.max(a, Math.min(b, x));
+    const run = (o) => TH.cueRun(Hud, Object.assign({ jitter: 15, shift: SHIFT, redline: RED, lead: 300, period: 66 }, o));
+    // before a pull the revs wander a little, as on a car (the same reading again would be no sample at all)
+    const wander = (base) => (t) => base + 25 * Math.sin(t / 90);
+    const pull = (rate, from) => (t) => (t < T0 ? wander(from || START)(t) : Math.min(RED, (from || START) + rate * (t - T0) / 1000));
+    const lit = (e) => Math.ceil(clamp((e.show - e.hud.from) / (e.hud.at - e.hud.from), 0, 1) * 11);
+    const frames = (r) => r.ev.filter((e) => e.hud);
+    const flashes = (r) => { let n = 0, was = false; frames(r).forEach((e) => { if (e.hud.shift && !was) n++; was = e.hud.shift; }); return n; };
+    const mm = (a) => Math.round(Math.min.apply(null, a)) + '..' + Math.round(Math.max.apply(null, a));
+
+    // the flash comes the lead before the true revs reach the shift point, whatever the climb rate. The lead is at
+    // most 2500 rpm and the flash never under 60 % of the shift point, so at 6000 and 8000 rpm/s a 500 ms lead is
+    // what those leave of it
+    [66, 100].forEach((period) => [300, 500].forEach((lead) => [2000, 4000, 6000, 8000].forEach((rate) => {
+        const tShift = T0 + (SHIFT - START) / rate * 1000;
+        const had = Math.min(lead, 2500 / rate * 1000, 0.4 * SHIFT / rate * 1000);
+        const early = [], spans = [];
+        let same = true;
+        SEEDS.forEach((seed) => {
+            const r = run({ rpmAt: pull(rate), period: period, lead: lead, seed: seed, until: tShift + 200 });
+            early.push(r.flashAt === null ? NaN : tShift - r.flashAt);
+            const f = frames(r).filter((e) => e.hud.shift)[0];
+            spans.push(f ? f.hud.at - f.hud.from : NaN);
+            // the screen's cue and the HUD's: the same flash point and the same flash, sample by sample
+            r.ev.forEach((e) => { if (e.screen && e.hud && (e.screen.at !== e.hud.at || e.screen.shift !== e.hud.shift)) same = false; });
+        });
+        const mean = early.reduce((a, b) => a + b, 0) / early.length, tag = rate + ' rpm/s, lead ' + lead + ', samples every ' + period + ' ms';
+        ok(early.every((e) => e >= had - 60), 'flash on time: at least ' + Math.round(had - 60) + ' ms before the shift point (' + mm(early) + ') at ' + tag);
+        ok(early.every((e) => e <= had + 80), 'flash on time: not over 80 ms too early (' + mm(early) + ') at ' + tag);
+        ok(early.every((e) => Math.abs(e - mean) <= 60), 'flash on time: within 60 ms of the mean from run to run (' + mm(early) + ', mean ' + Math.round(mean) + ') at ' + tag);
+        const span = clamp(rate * 0.8, 800, 2500);
+        ok(spans.every((s) => Math.abs(s - span) <= span * 0.1), 'count-in: 0.8 s of climb, 800..2500 rpm (' + mm(spans) + ' for ' + span + ') at ' + tag);
+        ok(same, 'the screen and the HUD flash together at ' + tag);
+    })));
+    ok(Math.min(300, 2500 / 4000 * 1000) === 300 && Math.min(500, 2500 / 4000 * 1000) === 500, 'up to 4000 rpm/s a 300 and a 500 ms lead are had whole');
+
+    // the count-in lasts 0.6-1.1 s where 0.8 s of climb fits under the flash (to 3000 rpm/s); faster, the 2500 rpm
+    // it is kept to are less than that (0.6 s at 4000 rpm/s), and a pull from low revs is through them sooner
+    [66, 100].forEach((period) => [2000, 3000, 4000, 6000, 8000].forEach((rate) => {
+        const tShift = T0 + (SHIFT - START) / rate * 1000, count = [];
+        SEEDS.forEach((seed) => { const r = run({ rpmAt: pull(rate), period: period, seed: seed, until: tShift + 200 }); count.push(r.flashAt - r.countAt); });
+        const lo = rate <= 3000 ? 600 : rate <= 4000 ? 500 : 80;
+        ok(count.every((c) => c >= lo && c <= 1100), 'count-in: ' + lo + '-1100 ms at ' + rate + ' rpm/s, samples every ' + period + ' ms (' + mm(count) + ')');
+    }));
+
+    // separate cue states fed by the one climb rate: the same flash point whenever neither is flashing
+    {
+        const r = run({ rpmAt: pull(4000), seed: 3, until: 3200, own: true });
+        ok(r.ev.every((e) => !e.screen || !e.hud || e.screen.shift || e.hud.shift || e.screen.at === e.hud.at), 'two cue states on one climb rate count into the same flash point');
+    }
+
+    // a lone spike (+1500 rpm for one sample) at a steady 3500: no flash, on the screen or the HUD, and the flash point stays
+    [66, 100].forEach((period) => [300, 500].forEach((lead) => SEEDS.slice(0, 6).forEach((seed) => {
+        const r = run({ rpmAt: (t) => wander(3500)(t) + (t === 30 * period ? 1500 : 0), period: period, lead: lead, seed: seed, until: 4000 });
+        ok(r.ev.every((e) => !(e.screen && e.screen.shift) && !(e.hud && e.hud.shift)), 'a one-sample spike at 3500 does not flash (lead ' + lead + ', ' + period + ' ms, seed ' + seed + ')');
+        ok(r.ev.every((e) => !e.screen || e.screen.at === SHIFT), 'a one-sample spike moves no flash point (lead ' + lead + ', ' + period + ' ms, seed ' + seed + ')');
+    })));
+    // the same on a 2000 rpm/s climb through 3500
+    SEEDS.slice(0, 6).forEach((seed) => {
+        const r = run({ rpmAt: (t) => pull(2000, 2500)(t) + (t === 30 * 66 ? 1500 : 0), seed: seed, until: 2600 });
+        ok(r.ev.every((e) => !(e.screen && e.screen.shift) && !(e.hud && e.hud.shift)), 'a one-sample spike on a climb does not flash (seed ' + seed + ')');
+    });
+
+    // wheelspin: 250 ms at 8000 rpm/s, then the revs stand at 5000. The early flash lets go within about 0.5 s
+    [66, 100].forEach((period) => SEEDS.slice(0, 6).forEach((seed) => {
+        const stop = T0 + 250;
+        const r = run({ rpmAt: (t) => (t < T0 ? wander(3000)(t) : t < stop ? 3000 + 8 * (t - T0) : 5000 + 10 * Math.sin(t / 90)), period: period, seed: seed, until: stop + 2500 });
+        const on = frames(r).filter((e) => e.hud.shift), lastOn = on.length ? on[on.length - 1].t : null;
+        ok(on.length > 0 && on[0].t < stop + 100, 'wheelspin: the early flash fires (samples every ' + period + ' ms, seed ' + seed + ')');
+        ok(lastOn !== null && lastOn - stop <= 550 && flashes(r) === 1, 'wheelspin that stops: the flash lets go within 0.55 s and stays off (' + Math.round(lastOn - stop) + ' ms, ' + flashes(r) + ' flashes)');
+        ok(frames(r).filter((e) => e.t > stop + 700).every((e) => e.hud.at === SHIFT), 'wheelspin that stops: the lead starts again from none');
+    }));
+
+    // a steady hold just under the shift point, with a little noise: no flash, the lights stand still (the flash
+    // point is 150 under the shift point here; held nearer than the revs climb in a frame or two, the drawn revs
+    // can run on into it before the next sample)
+    [66, 100].forEach((period) => SEEDS.slice(0, 6).forEach((seed) => {
+        const noise = TH.prng(100 + seed), hold = T0 + (SHIFT - 300 - 5000) / 0.5;
+        const r = run({ rpmAt: (t) => (t < T0 ? wander(5000)(t) : t < hold ? 5000 + 0.5 * (t - T0) : SHIFT - 300 + 10 * Math.sin(t / 150) + (noise() * 2 - 1) * 8), period: period, seed: seed, until: hold + 3000 });
+        const held = frames(r).filter((e) => e.t > hold + 300).map(lit);
+        ok(flashes(r) === 0 && r.ev.every((e) => !(e.screen && e.screen.shift)), 'a hold 300 under the shift point does not flash (samples every ' + period + ' ms, seed ' + seed + ')');
+        ok(Math.max.apply(null, held) - Math.min.apply(null, held) <= 1 && Math.min.apply(null, held) >= 8, 'a hold under the shift point: the lights stand still (' + Math.min.apply(null, held) + '..' + Math.max.apply(null, held) + ' lit)');
+    }));
+    // coming up fast, then holding under it: the early flash once, then the count, no flicker
+    SEEDS.slice(0, 6).forEach((seed) => {
+        const hold = T0 + (SHIFT - 200 - 3000) / 3;
+        const r = run({ rpmAt: (t) => (t < T0 ? wander(3000)(t) : t < hold ? 3000 + 3 * (t - T0) : SHIFT - 200 + 10 * Math.sin(t / 150)), seed: seed, until: hold + 3000 });
+        const on = frames(r).filter((e) => e.hud.shift);
+        ok(flashes(r) === 1 && on[on.length - 1].t - hold <= 550, 'a fast climb held under the shift point: one flash, let go within 0.55 s (' + flashes(r) + ', ' + Math.round(on[on.length - 1].t - hold) + ' ms)');
+    });
+
+    // a lift before the flash: the lights step down one at a time, no jump, no flash
+    [66, 100].forEach((period) => SEEDS.slice(0, 4).forEach((seed) => {
+        const top = T0 + 1000;
+        const r = run({ rpmAt: (t) => (t < T0 ? wander(3000)(t) : t < top ? 3000 + 3 * (t - T0) : Math.max(2500, 6000 - 2 * (t - top))), period: period, lead: 0, seed: seed, until: top + 1700 });
+        const down = frames(r).filter((e) => e.t >= top + 2 * period).map(lit);
+        let steps = true;
+        for (let i = 1; i < down.length; i++) if (down[i] > down[i - 1] || down[i - 1] - down[i] > 1) steps = false;
+        ok(flashes(r) === 0 && steps && down[0] >= 6 && down[down.length - 1] === 0, 'a lift steps the lights down one at a time (' + down.join(' ') + ')');
+    }));
+
+    // an upshift: the flash ends with the gear change, the next gear counts in afresh and flashes on time again
+    [66, 100].forEach((period) => SEEDS.slice(0, 4).forEach((seed) => {
+        const up = T0 + (SHIFT - 2500) / 4, t2 = up + (SHIFT - 4500) / 2;
+        const r = run({ rpmAt: (t) => (t < T0 ? wander(2500)(t) : t < up ? 2500 + 4 * (t - T0) : 4500 + 2 * (t - up)), gearAt: (t) => (t < up ? 2 : 3), period: period, seed: seed, until: t2 + 100 });
+        const fr = frames(r), before = fr.filter((e) => e.t < up - 16), after = fr.filter((e) => e.t >= up + period + 16);
+        const plain = after.filter((e) => e.t < up + 2 * period)[0] || after[0], again = after.filter((e) => e.hud.shift)[0];
+        ok(before[before.length - 1].hud.shift && !after[0].hud.shift, 'an upshift ends the flash (samples every ' + period + ' ms, seed ' + seed + ')');
+        ok(plain.hud.at === SHIFT && plain.hud.from === SHIFT - 1500, 'an upshift: the next gear starts from the plain count (' + plain.hud.from + '..' + plain.hud.at + ')');
+        ok(again && t2 - again.t >= 300 - 60 && t2 - again.t <= 300 + 80 && flashes(r) === 2, 'an upshift: the next gear flashes on time again (' + (again ? Math.round(t2 - again.t) : 'never') + ' ms early)');
+    }));
+
+    // the plain rev bar and the limiter are 2.0.39's, value for value (its lines, kept here to compare with)
+    {
+        const rev39 = (rpm, redline, show, revFrom) => {
+            const r = typeof show === 'number' ? show : rpm, from = clamp(revFrom, 0, redline - 500);
+            return { from: from, at: redline, shift: r >= redline, limiter: rpm >= redline - 40, rate: 0, fallSince: null };
+        };
+        let sameRev = true, sameLim = true, n = 0;
+        [6000, 7000].forEach((redline) => [2000, 4000, 6800].forEach((revFrom) => [undefined, 250].forEach((ahead) => [false, true].forEach((withClimb) => {
+            const st = {}, climb = {};
+            for (let rpm = 3000, t = 0; rpm <= redline + 100; rpm += 137, t += 66) {
+                const show = ahead === undefined ? undefined : rpm + ahead;
+                if (withClimb) Hud.climbFeed(climb, rpm, t);
+                const q = Hud.shiftCue(st, rpm, t, redline - 500, redline, 300, 3, show, revFrom, withClimb ? climb : undefined);
+                if (JSON.stringify(q) !== JSON.stringify(rev39(rpm, redline, show, revFrom))) sameRev = false;
+                n++;
+            }
+        }))));
+        ok(sameRev && n > 300, 'rev bar: every value as in 2.0.39 (' + n + ' compared)');
+        [2000, 5000, 9000].forEach((rate) => [undefined, 250].forEach((ahead) => {
+            const st = {};
+            for (let t = 0, rpm = 3000; rpm <= 7100; t += 66, rpm = 3000 + rate * t / 1000) {
+                const q = Hud.shiftCue(st, rpm, t, 6500, 7000, 300, 3, ahead === undefined ? undefined : rpm + ahead);
+                if (q.limiter !== (rpm >= 7000 - 40)) sameLim = false;
+            }
+        }));
+        ok(sameLim, 'limiter: within 40 of the redline by the real rpm, as in 2.0.39');
+        ok(JSON.stringify(Hud.shiftCue({}, null, 0, 6500, 7000, 300)) === JSON.stringify({ from: 5000, at: 6500, shift: false, limiter: false, rate: 0, fallSince: null }), 'no rpm: the plain count, nothing lit, as in 2.0.39');
+    }
+
+    // the limits: the rate counts to 8000 rpm/s, the lead to 2500 rpm, the flash never under 60 % of the shift point
+    {
+        const at = (rate, lead, shift) => {
+            const st = {}, c = {};
+            let q;
+            for (let i = 0; i < 6; i++) { Hud.climbFeed(c, 1000 + rate * i * 0.066, i * 66); q = Hud.shiftCue(st, 1000 + rate * i * 0.066, i * 66, shift, shift + 500, lead, 2, undefined, undefined, c); }
+            return Math.round(q.at);
+        };
+        ok(at(12000, 300, 6500) === 6500 - 2400, 'limits: a climb over 8000 rpm/s counts as 8000 (' + at(12000, 300, 6500) + ')');
+        ok(at(6000, 800, 6500) === 6500 - 2500, 'limits: the lead is at most 2500 rpm (' + at(6000, 800, 6500) + ')');
+        ok(at(6000, 800, 4500) === 2700, 'limits: the flash never under 60 % of the shift point (' + at(6000, 800, 4500) + ')');
+        ok(at(1000, 300, 6500) === 6200 && at(1000, 0, 6500) === 6500, 'limits: a slow climb takes the lead as asked');
+    }
+
+    // the climb rate: a hold lets it decay, a lift starts it afresh, two readings at once count as one
+    {
+        const c = {};
+        for (let i = 0; i < 8; i++) Hud.climbFeed(c, 3000 + i * 264, i * 66);
+        ok(Math.abs(c.rate - 4000) < 5 && c.up >= 2, 'climb rate: 4000 rpm/s from even samples (' + Math.round(c.rate) + ')');
+        Hud.climbFeed(c, 3000 + 8 * 264, 8 * 66 + 3);
+        ok(Math.abs(c.rate - 4000) < 400, 'climb rate: a reading 3 ms after another replaces it (' + Math.round(c.rate) + ')');
+        const before = c.rate;
+        Hud.climbFeed(c, c.rpm, c.at + 30);
+        ok(c.rate === before, 'climb rate: the same reading again is no news');
+        Hud.climbFeed(c, c.rpm - 10, c.at + 66);
+        ok(c.rate < before && c.rate > 0 && c.up === 0, 'climb rate: a hold lets it decay');
+        Hud.climbFeed(c, c.rpm - 400, c.at + 66);
+        ok(c.rate === 0 && c.fall !== null, 'climb rate: a lift starts it afresh');
+        Hud.climbFeed(c, null, c.at + 66);
+        ok(c.rate === 0 && c.rpm === null, 'climb rate: no rpm, no rate');
+    }
+
+    // the reaction lead from one shift: the lead the flash really had plus how late the shift came, 100..800 ms
+    {
+        const f = { rate: 4000, target: 6500, leadRpm: 1200 };
+        ok(Hud.reactionMs(f, 6500) === 300 && Hud.reactionMs(f, 6900) === 400 && Hud.reactionMs(f, 6100) === 200, 'reaction: the lead the flash had (300 ms) plus how late the shift came');
+        ok(Hud.reactionMs({ rate: 4000, target: 6500, leadRpm: 2400 }, 6500) === 600, 'reaction: a long lead on a fast climb counts whole (no 800 rpm cap)');
+        ok(Hud.reactionMs({ rate: 4000, target: 6500, leadRpm: 400 }, 6100) === 100 && Hud.reactionMs({ rate: 1000, target: 6500, leadRpm: 500 }, 7000) === 800, 'reaction: kept to 100..800 ms');
+        ok(Hud.LEAD_DEFAULT === 300, 'reaction: 300 ms until learned');
+        // from a run: the flash as the HUD notes it (the rate at the flash, the rpm it showed), the shift 120 ms late
+        [300, 500].forEach((lead) => SEEDS.slice(0, 6).forEach((seed) => {
+            const tShift = T0 + (SHIFT - START) / 4, r = run({ rpmAt: pull(4000), lead: lead, seed: seed, until: tShift + 200 });
+            const e = frames(r).filter((x) => x.hud.shift)[0];
+            const ideal = Hud.reactionMs({ rate: r.st.fired.rate, target: SHIFT, leadRpm: SHIFT - e.show }, SHIFT + 4 * 120);
+            ok(Math.abs(ideal - (tShift + 120 - e.t)) <= 30, 'reaction: learns the time from the flash to the shift (' + Math.round(ideal) + ' for ' + Math.round(tShift + 120 - e.t) + ' ms)');
+            ok(Math.abs(ideal - (lead + 120)) <= 80, 'reaction: a shift 120 ms late asks for the lead plus 120 (' + Math.round(ideal) + ' for ' + (lead + 120) + ')');
+        }));
+    }
 }
 
 /* ---------- driving mode (Comfort / Eco Pro) ---------- */
@@ -508,10 +706,6 @@ for (let t = 0; t < Hud.DEMO_MS * 3; t += 37) {
     // Minimal's dots can go up over BMW's own ramp (2026-11-10, an X3 M40i): Up reaches -120, and the empty top of its
     // picture isn't counted as off the glass
     ok(at({ hudY: -120 }).y === 20 && Hud.outsideGlass(at({ hudY: -60 }), 'minimal').top === 11 && Hud.outsideGlass(at({ hudY: -40 }), 'minimal').top === undefined, 'place: Minimal up to -120, only its empty top (above the D / S / M letter) not counted off the glass');
-    // reaction time: a slow climb takes the lead as asked; a fast one only the 800 rpm it really had
-    ok(Hud.reactionMs({ rate: 1000, target: 6000, lead: 300 }, 6000) === 300, 'reaction: on time at 1000 rpm/s');
-    ok(Hud.reactionMs({ rate: 4000, target: 6000, lead: 300 }, 6000) === 200 && Hud.reactionMs({ rate: 4000, target: 6000, lead: 300 }, 6200) === 250, 'reaction: capped lead on a fast climb');
-    ok(Hud.reactionMs({ rate: 4000, target: 6000, lead: 300 }, 5000) === 0 && Hud.reactionMs({ rate: 500, target: 6000, lead: 300 }, 6500) === 600, 'reaction: clamped 0..600');
     // the test pattern at another size: the tach is blended over it (dim parts stay dim, empty stays empty)
     const cv = new Canvas(600, 300), bgc = [40, 40, 40, 255];
     cv.clear(bgc);
@@ -1045,5 +1239,9 @@ function electricalChecks() {
         t = QuietLog.REPEAT_MS + 1; q.info('knock: retard 2.3 deg');
         ok(lines[lines.length - 1] === 'knock: retard 2.3 deg (+2 like it)', 'quiet log: after 10 minutes again, with the count held back (' + lines[lines.length - 1] + ')');
         ok(QuietLog.wrap(q) === q, 'quiet log: wrapping twice is the same');
+        // the HUD's flash and once-a-minute lines keep their own limits: always() holds none back
+        const n0 = lines.length;
+        q.always('hud: flash g2 4000 rpm/s'); q.always('hud: flash g3 2000 rpm/s');
+        ok(lines.length === n0 + 2 && lines[lines.length - 1] === 'hud: flash g3 2000 rpm/s', 'quiet log: always() lines all go through');
     });
 }

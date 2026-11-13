@@ -4,7 +4,7 @@
  *
  * Keeps redline.log small: the same kind of line (its text with the numbers taken out) is written at most once
  * every REPEAT_MS; the next one after that says how many were held back ("(+12 like it)"). Errors always go
- * through. The file itself is the kit's: 256 KiB, then renamed to redline.log.1 over the older one (two files at
+ * through, and so does always(): for lines that keep their own limit (the HUD's flash and once-a-minute lines). The file itself is the kit's: 256 KiB, then renamed to redline.log.1 over the older one (two files at
  * most). Debug lines are not written to the file at all.
  */
 const REPEAT_MS = 10 * 60 * 1000, MAX_KINDS = 400;
@@ -29,7 +29,7 @@ function wrap(log, now) {
             return log[lvl].apply(log, held ? a.concat([held]) : a);
         } catch (e) { try { return log[lvl].apply(log, a); } catch (e2) { /* never */ } }
     };
-    return { error: log.error.bind(log), warn: quiet('warn'), info: quiet('info'), debug: log.debug ? log.debug.bind(log) : () => {}, quiet: true };
+    return { error: log.error.bind(log), warn: quiet('warn'), info: quiet('info'), always: log.info.bind(log), debug: log.debug ? log.debug.bind(log) : () => {}, quiet: true };
 }
 
 module.exports = { wrap, REPEAT_MS };

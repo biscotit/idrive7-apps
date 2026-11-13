@@ -8,7 +8,9 @@
 // - the knock warning and the launch time where the grade shows;
 // - the tyre widget in the directions' corner: when a tyre is low (or always, or never), the directions first;
 // - "Play on HUD" and the HUD looks preview: the same demo frame (blink and shake);
-// - the HUD off stops every UDS reader (the electrical one too).
+// - the HUD off stops every UDS reader (the electrical one too);
+// - 2.0.40: with the app's own cue the HUD flashes with the screen, draws a sample in the count at once, logs each
+//   flash and a line a minute, and learns the reaction lead from the lead the flash really had.
 
 const fs = require('fs');
 const path = require('path');
@@ -186,7 +188,7 @@ const log = { info() {}, warn() {}, error() {} };
     {
         const main = fs.readFileSync(path.join(ROOT, 'apps', 'redline', 'main.js'), 'utf8');
         const pv = main.slice(main.indexOf('const studioFrame'), main.indexOf('function lookLayer('));
-        ok(/Hud\.demoFrame\(now - studio\.t0, Hud\.optsFrom\(studioP\(\)\), studio\.cue, hud \? hud\.lead\(\) : 200, now\)/.test(pv) && !/blink|shake|SHAKE/.test(pv),
+        ok(/Hud\.demoFrame\(now - studio\.t0, Hud\.optsFrom\(studioP\(\)\), studio\.cue, hud \? hud\.lead\(\) : Hud\.LEAD_DEFAULT, now\)/.test(pv) && !/blink|shake|SHAKE/.test(pv),
             'the preview takes its frame from Hud.demoFrame, no blink or shake of its own');
         settings.set('hudShake', true); speed = 0;
         const realNow = Date.now;
@@ -217,6 +219,95 @@ const log = { info() {}, warn() {}, error() {} };
     ok(corners().length === 0 && h.corner() === '', 'HUD off: the tyre widget gone too');
 
     h.stop();
+
+    // 2.0.40: the app's own cue and climb rate (src.cue, fed per rpm sample as main.js does): a sample in the count
+    // is drawn at once, each flash is logged with its outcome, the lead is learned from what the flash really had,
+    // and a line a minute says how the drawing went. The steady clock (process.hrtime) is moved by hand.
+    {
+        const dir = path.join(TMP, 'lead');
+        fs.mkdirSync(dir);
+        fs.writeFileSync(path.join(dir, 'hudlead.json'), JSON.stringify({ ms: 40, n: 7 }));
+        const lines = [], log2 = { info: (s) => lines.push(String(s)), warn() {}, error: (s) => lines.push('E ' + s), debug() {}, always: (s) => lines.push(String(s)) };
+        const v2 = Object.assign({}, def, { hud: 'on', hudStyle: 'standard', hudFps: 20, hudComfortMode: 'same' }), fns2 = [];
+        const settings2 = { get: (k) => v2[k], set: (k, x) => { v2[k] = x; fns2.forEach((f) => f(k, x)); }, onChange: (f) => fns2.push(f) };
+        const cueState = {}, climb = {};
+        let rpm2 = 3000, gear2 = 2, mode2 = 'M', mono = 1e6;
+        const src2 = { data: () => ({ rpm: rpm2, gear: gear2, stage: 'D', speed: 60, oil: 95, coolant: 92 }), shiftPoint: () => ({ rpm: 6500, cold: false }), redline: () => 7000,
+            maxRpm: () => 8000, driveMode: () => 'sport', mode: () => mode2, cue: { state: cueState, climb: climb } };
+        const realHr = process.hrtime;
+        process.hrtime = () => [Math.floor(mono / 1000), Math.round((mono % 1000) * 1e6)];
+        try {
+            const h2 = Hud.start({ settings: settings2, log: log2, dataDir: dir }, src2);
+            ok(h2.lead() === 100 && h2.learned().shifts === 7, 'reaction lead: one learned under 100 ms (before 2.0.40) reads as 100 (' + h2.lead() + ')');
+            await sleep(150);
+            cr.h.target('hud', 'shown', '', '', false, false);
+            // what main.js does with each rpm sample: the climb rate, the screen's cue, then the HUD
+            let screen = null;
+            const feed = (r, step) => {
+                mono += step === undefined ? 66 : step; rpm2 = r;
+                const n = climb.n;
+                Hud.climbFeed(climb, r, mono);
+                screen = Hud.shiftCue(cueState, r, mono, 6500, 7000, h2.lead(), gear2, undefined, null, climb);
+                if (climb.n !== n) h2.sampled();
+            };
+            const settle = () => { gear2 = 2; for (let i = 0; i < 14; i++) feed(3000 + 20 * (i % 2)); };
+            // a pull at 4000 rpm/s to rpm `to`: returns the frames sent during the count and the flash
+            const pullTo = (to) => { const n0 = cr.frames.length; let k = 0; for (let r = 3264; r <= to; r += 264) { feed(r); k++; } return { sent: cr.frames.length - n0, samples: k }; };
+            settle();
+            const p1 = pullTo(6700);
+            // (no timer tick ran in between: this loop never yields, so the count's start is the one of the last tick's frame)
+            ok(p1.sent >= 6, 'a sample in the count or the flash is drawn at once, not at the next tick (' + p1.sent + ' frames for ' + p1.samples + ' samples)');
+            const f1 = h2.frame();
+            ok(screen.shift && f1.cue.shift && f1.cue.at === screen.at, "the HUD's cue is the screen's: the same flash (" + f1.cue.at + ' / ' + screen.at + ')');
+            const n1 = cr.frames.length;
+            feed(6710, 5);
+            ok(cr.frames.length === n1, 'a sample 5 ms after a frame is not drawn at once: never over 30 frames a second');
+            gear2 = 3; feed(4700); h2.upshift(6700);
+            const l1 = lines.filter((s) => /^hud: flash /.test(s));
+            ok(l1.length === 1 && /^hud: flash g2 \d+ rpm\/s, lead 100 ms \/ \d+ rpm, point 6500, fired \d+, shift, standard; upshift 6700 \(\d+ ms late\), lead now \d+ ms after 8 shifts$/.test(l1[0]),
+                'the flash is logged with its upshift (' + l1.join(' | ') + ')');
+            const m = /(\d+) rpm\/s, lead 100 ms \/ (\d+) rpm, point 6500, fired (\d+).*\((\d+) ms late/.exec(l1[0] || '') || [];
+            ok(Math.abs(m[1] - 4000) < 200 && Math.abs(m[2] - 400) < 30 && m[3] >= 5900 && m[3] <= 6500 && Math.abs(m[4] - 50) <= 5, 'the flash line: the rate, the lead in rpm, where it fired, how late the shift came (' + m.slice(1).join(' ') + ')');
+            // the lead moves 30 % of the way to what would have hit the point: the lead the flash had plus the 50 ms
+            const ideal = (6700 - m[3]) / m[1] * 1000, want = Math.round((100 + (Math.max(100, Math.min(800, ideal)) - 100) * 0.3) / 10) * 10;
+            ok(h2.lead() === want && h2.lead() > 100 && h2.learned().shifts === 8, 'reaction lead: learned from the lead the flash really had (' + h2.lead() + ' for ' + want + ')');
+            ok(JSON.parse(fs.readFileSync(path.join(dir, 'hudlead.json'), 'utf8')).ms === h2.lead(), 'reaction lead: kept in hudlead.json');
+            // another flash within 5 s: learned from, not logged
+            const lead1 = h2.lead();
+            settle(); pullTo(6900); gear2 = 3; feed(4900); h2.upshift(6900);
+            ok(lines.filter((s) => /^hud: flash /.test(s)).length === 1 && h2.learned().shifts === 9 && h2.lead() >= lead1, 'a second flash within 5 s is not logged, but learned from');
+            // in D the gearbox shifts: logged, nothing learned
+            mono += 6000; mode2 = 'D';
+            const lead2 = h2.lead();
+            settle(); pullTo(6700); gear2 = 3; feed(4700); h2.upshift(6700);
+            const l3 = lines.filter((s) => /^hud: flash /.test(s));
+            ok(l3.length === 2 && /; upshift 6700 \(\d+ ms late\)$/.test(l3[1]) && h2.lead() === lead2 && h2.learned().shifts === 9, 'a shift in D: logged, not learned from (' + l3[1] + ')');
+            // logged only, when the app says not to learn (learning frozen)
+            mono += 6000; mode2 = 'M';
+            settle(); pullTo(6700); gear2 = 3; feed(4700); h2.upshift(6700, false);
+            ok(lines.filter((s) => /^hud: flash /.test(s)).length === 3 && h2.lead() === lead2, 'learning frozen: the flash is logged, the lead stays');
+            // no upshift within 2 s of the flash: logged as such
+            mono += 6000;
+            settle(); pullTo(6600);
+            for (let i = 0; i < 34; i++) feed(6600 + 5 * (i % 2));
+            h2.frame();
+            const l5 = lines.filter((s) => /^hud: flash /.test(s));
+            ok(l5.length === 4 && /; no upshift$/.test(l5[3]), 'a flash without an upshift is logged after 2 s (' + l5[l5.length - 1] + ')');
+            ok(!lines.some((s) => /^E /.test(s)), 'no errors on the way (' + lines.filter((s) => /^E /.test(s)).join(' | ') + ')');
+            // the minute's line: only with 100 frames or more drawn in it
+            gear2 = 3; feed(5700);
+            for (let i = 0; i < 130; i++) feed(5700 + 30 * (i % 20), 40);
+            mono += 61000; await sleep(160);
+            const pl = lines.filter((s) => /^hud: 1 min: /.test(s));
+            ok(pl.length === 1 && /^hud: 1 min: \d+ frames drawn, \d+ sent, \d+ KB, ticks late [\d.]+ \/ [\d.]+ ms, draw [\d.]+ \/ [\d.]+ ms, socket blocked 0, rpm every \d+ \+- \d+ ms$/.test(pl[0]),
+                "the minute's line (" + pl.join(' | ') + ')');
+            const pm = /(\d+) frames drawn, (\d+) sent, (\d+) KB/.exec(pl[0] || '') || [];
+            ok(pm[1] >= 100 && +pm[2] <= +pm[1] && pm[3] > 0, "the minute's line counts the frames drawn and sent (" + pm.slice(1).join(' ') + ')');
+            mono += 61000; await sleep(160);
+            ok(lines.filter((s) => /^hud: 1 min: /.test(s)).length === 1, 'a minute with under 100 frames drawn: no line');
+            h2.stop();
+        } finally { process.hrtime = realHr; }
+    }
     TH.rmTree(TMP);
     console.log('redline running: ' + tally.checks + ' checks, ' + tally.fails + ' failed');
     process.exit(tally.fails ? 1 : 0);
