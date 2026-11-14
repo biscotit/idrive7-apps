@@ -441,17 +441,32 @@ The 12 lights are a **shift** light, not a rev scale:
   timed on a clock that never jumps. Samples arrive some ms early or late, so each one's time is
   drawn towards the last one plus the usual step. The lead and the count take the rate two samples
   in a row agree on, from the second rising sample on and only on a climb of 100 rpm or more over
-  those 250 ms: one spiky reading, or sensor noise on a steady hold, moves nothing. Standing
-  still (speed under 5 km/h) there is no lead: launch control or revving flashes at the shift
-  point only.
+  those 250 ms: one spiky reading, or sensor noise on a steady hold, moves nothing.
+- **A pull, or only revs?** In gear the road speed rises with the revs, in proportion. In a
+  downshift's blip, a kickdown's flare, a launch's flare, converter slip or wheelspin the revs
+  rise and the speed doesn't. So a lead of more than 800 rpm (what 2.0.39 had at most) is given
+  only while the speed is seen to rise at half the revs' relative rate or more, over its readings
+  of the last 600 ms (`pullRatio` in `hud.js`); it stops counting after two samples under 0.3 of
+  it. In a pull in 1st to 4th the ratio is 0.6 or more with the speed in steps of 0.1 or 1 km/h,
+  every 100 or 200 ms and up to 200 ms late, and the pull is seen within 0.1–0.7 s of its start;
+  until then, and with no speed signal at all, the lead is 800 rpm at most. Without the speed
+  rising, the flash under the shift point also goes by the real reading, not the one drawn on
+  between samples. Standing still (speed under 5 km/h) there is no lead: launch control or
+  revving flashes at the shift point only.
 - **On time.** While the lights count or flash, the HUD draws each new rpm sample at once instead
   of at its next frame (never more than 30 frames a second), and the flash goes by where the revs
   will be half a frame on.
 - **Ending the flash.**
-  - A gear change ends it, and the next gear counts in afresh.
+  - A gear change ends it, and the next gear counts in afresh. A gear change is one gear number
+    after another while the car rolls, seen on two samples or with the revs falling: a number
+    that flaps for one sample is none, and neither is a number that comes after there was none
+    (a gear guessed from the speed is gone under 3 km/h, and the first guess after a stop is no
+    shift). A downshift starts the lead and the count afresh but leaves a flash that is due:
+    a downshift onto the shift point flashes there.
   - Without a gear signal, a drop of 12 % from the highest rpm while flashing ends it. An upshift
     drops 18 % or more on an 8-speed; a traction dip drops less.
-  - Revs falling for 300 ms (a lift) also end it.
+  - Revs falling for 300 ms (a lift) also end it, once they are 100 rpm under the shift point.
+    Not within 500 ms of a sample on the limiter: the revs bounce there.
   - **Under the shift point** the flash stays only while the revs are still due there: the time
     to the shift point at the rate they climb now, (shift point − rpm) ÷ rate, within the lead
     plus 100 ms. Two samples in a row that say otherwise and it lets go, the lead starting again
@@ -464,7 +479,9 @@ The 12 lights are a **shift** light, not a rev scale:
   - **After a shift ended a flash** the lights stay out of flash for 350 ms and the climb rate
     starts afresh: the next gear's revs can land above the old flash point, and at 5 Hz a shorter
     break would read as one long flash. A gear number that comes within a second of the rev drop
-    is the same shift. After a downshift (a blip, a kickdown) there is no lead for 500 ms.
+    is the same shift.
+  - The ambient light's red flash waits until the flash is firm: two samples have found it due,
+    or it is at the shift point.
 - **Lifting or holding.**
   - Lift before the shift point and the lights step back down one at a time.
   - Hold a steady rpm below the shift point and the count stays steady.

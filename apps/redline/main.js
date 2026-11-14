@@ -335,16 +335,18 @@ mgu.run({
         car.onSample((d, t) => {
             // the cue's clock: when the sample arrived, on a clock that never jumps (t is the wall clock, set from GPS)
             const tm = Hud.monoMs(), seen = climb.n;
-            Hud.climbFeed(climb, d.rpm, tm);
+            Hud.climbFeed(climb, d.rpm, tm, d.speed);
             if (!G.isNum(d.rpm)) { screenCue = null; Hud.shiftCue(cueState, null, tm, 0, 0, 0); return; }
             recent.push([t, d.rpm, d.speed]);
             while (recent.length && t - recent[0][0] > 1200) recent.shift();
             // the screen's shift cue, the HUD's own (count-in by climb rate, early flash, lift handling),
             // updated on each sample so a fast screen doesn't see repeated readings
             screenCue = cueNow(tm);
-            // the moment the cue flashes: the ambient light flashes red too (real drives only; once per flash of its own)
-            if (screenCue.shift && !cueShift && !car.data().demo && tm - ambientAt > 1500) { ambientAt = tm; Hud.writeAtomic(AMBIENT_FLASH, JSON.stringify({ rgb: [255, 0, 0], ms: 1200 }) + '\n'); }
-            cueShift = !!screenCue.shift;
+            // the cue flashes: the ambient light flashes red too (real drives only; once per flash of its own, and
+            // only for one that is firm: on over two samples or at the shift point, not a one-sample flash under it)
+            const firm = screenCue.firm === undefined ? screenCue.shift : screenCue.firm;
+            if (firm && !cueShift && !car.data().demo && tm - ambientAt > 1500) { ambientAt = tm; Hud.writeAtomic(AMBIENT_FLASH, JSON.stringify({ rgb: [255, 0, 0], ms: 1200 }) + '\n'); }
+            cueShift = !!firm;
             // slowing (for the downshift cue): braking, down at least 6 km/h per second (~0.17 g) over
             // the last 0.5 s; coasting off the throttle stays under it
             const back = recent.find((r) => t - r[0] <= 500);

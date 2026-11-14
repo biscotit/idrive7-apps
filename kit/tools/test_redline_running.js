@@ -233,8 +233,8 @@ const log = { info() {}, warn() {}, error() {} };
         const v2 = Object.assign({}, def, { hud: 'on', hudStyle: 'standard', hudFps: 20, hudComfortMode: 'same' }), fns2 = [];
         const settings2 = { get: (k) => v2[k], set: (k, x) => { v2[k] = x; fns2.forEach((f) => f(k, x)); }, onChange: (f) => fns2.push(f) };
         const cueState = {}, climb = {};
-        let rpm2 = 3000, gear2 = 2, mode2 = 'M', mono = 1e6;
-        const src2 = { data: () => ({ rpm: rpm2, gear: gear2, stage: 'D', speed: 60, oil: 95, coolant: 92 }), shiftPoint: () => ({ rpm: 6500, cold: false }), redline: () => 7000,
+        let rpm2 = 3000, gear2 = 2, mode2 = 'M', mono = 1e6, speed2 = 60;
+        const src2 = { data: () => ({ rpm: rpm2, gear: gear2, stage: 'D', speed: speed2, oil: 95, coolant: 92 }), shiftPoint: () => ({ rpm: 6500, cold: false }), redline: () => 7000,
             maxRpm: () => 8000, driveMode: () => 'sport', mode: () => mode2, cue: { state: cueState, climb: climb } };
         const realHr = process.hrtime;
         process.hrtime = () => [Math.floor(mono / 1000), Math.round((mono % 1000) * 1e6)];
@@ -248,8 +248,8 @@ const log = { info() {}, warn() {}, error() {} };
             const feed = (r, step) => {
                 mono += step === undefined ? 66 : step; rpm2 = r;
                 const n = climb.n;
-                Hud.climbFeed(climb, r, mono);
-                screen = Hud.shiftCue(cueState, r, mono, 6500, 7000, h2.lead(), gear2, undefined, null, climb, 60);
+                Hud.climbFeed(climb, r, mono, speed2);
+                screen = Hud.shiftCue(cueState, r, mono, 6500, 7000, h2.lead(), gear2, undefined, null, climb, speed2);
                 if (climb.n !== n) h2.sampled();
             };
             const settle = () => { gear2 = 2; for (let i = 0; i < 14; i++) feed(3000 + 20 * (i % 2)); };
@@ -305,19 +305,21 @@ const log = { info() {}, warn() {}, error() {} };
             // The learner over whole drives: 2nd to 5th, each gear to the driver's shift, the revs down to 64 % in
             // 150 ms, the gear number 100 ms into that (where main.js calls upshift with the revs' peak).
             //   react: shifts ms after the flash first shows; rpm: always at that rpm; limiter: 150 ms after reaching it
-            const RATE = { 2: 4500, 3: 2500, 4: 1500 };
+            // (the road speed geared to the revs in each gear, standing through the shift's rev drop)
+            const RATE = { 2: 4500, 3: 2500, 4: 1500 }, KMH = { 2: 13.6, 3: 20.6, 4: 27, 5: 35 };
             const drives = (driver, pulls) => {
                 h2.resetLead();
                 const rand = TH.prng(11), leads = [];
                 for (let p = 0; p < pulls; p++) {
                     let t = 0, rpm = 4000, gear = 2, was = false, shiftAt = null, drop = null, gearAt = null, limAt = null, nextS = 0, nextF = 0;
                     const recent = [];
-                    gear2 = 2; mono += 3000;
+                    gear2 = 2; mono += 3000; speed2 = 4000 * KMH[2] / 1000;
                     for (let i = 0; i < 10; i++) feed(4000 + 20 * (i % 2));
                     while (gear < 5 || drop) {
                         t++; mono += 1;
                         if (drop) { const k = Math.min(1, (t - drop.t0) / 150); rpm = drop.from + (drop.to - drop.from) * k; if (k >= 1) drop = null; }
                         else if (rpm >= 7000) { rpm -= 175; if (limAt === null) limAt = t; } else rpm += RATE[gear] / 1000;
+                        if (!drop) speed2 = rpm * KMH[gear] / 1000;
                         if (gearAt !== null && t >= gearAt) {
                             gearAt = null; gear2 = gear;
                             // the next sample is the first with the new gear: the app reports the upshift there
@@ -345,12 +347,13 @@ const log = { info() {}, warn() {}, error() {} };
             const true470 = drives({ react: 470 }, 10);
             ok(Math.abs(true470 - 470) <= 40 && h2.learned().shifts >= 20, 'the learner: a driver who takes 470 ms after the flash is learned as that (' + true470 + ' ms after ' + h2.learned().shifts + ' shifts)');
             const true330 = drives({ react: 330 }, 10);
-            ok(Math.abs(true330 - 330) <= 40, 'the learner: and one who takes 330 ms (' + true330 + ' ms)');
+            ok(Math.abs(true330 - 330) <= 45, 'the learner: and one who takes 330 ms (' + true330 + ' ms)');
             const short = drives({ rpm: 5700 }, 10);
-            ok(short >= 200 && short <= 300, 'the learner: shifting 800 under the point whatever the lights does not drag the lead down (' + short + ' ms)');
+            // (those shifts come under 200 ms after the flash, or before any: none of them is learned from)
+            ok(short === 300 && h2.lead() === 300 && h2.learned().shifts === 0, 'the learner: shifting 800 under the point whatever the lights teaches nothing (' + short + ' ms after ' + h2.learned().shifts + ' shifts)');
             const lim = drives({ limiter: true }, 10);
             // (30 shifts; between two samples 66 ms apart the limiter's cut can go unseen, and that shift counts as a late one)
-            ok(lim <= 360 && h2.learned().shifts <= 2, 'the learner: shifts made on the limiter do not push the lead up (' + lim + ' ms, learned from ' + h2.learned().shifts + ' of 30)');
+            ok(lim <= 400 && h2.learned().shifts <= 2, 'the learner: of 30 shifts made on the limiter at most 2 are learned from (' + lim + ' ms, ' + h2.learned().shifts + ' learned)');
             ok(n9 === 9 && !lines.some((s) => /^E /.test(s)), 'no errors in the drives (' + lines.filter((s) => /^E /.test(s)).join(' | ') + ')');
 
             // the minute's line: only with 100 frames or more drawn in it

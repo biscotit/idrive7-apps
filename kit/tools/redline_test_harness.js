@@ -110,18 +110,24 @@ function prng(seed) {
  * sample's arrival), seed, frame (ms between the HUD's frames, 50), lead (ms), shift, redline, rev (the rev bar's
  * start, optional), until (ms), own (true: the HUD keeps its own cue state, fed by the same climb rate), speedAt(tMs)
  * (km/h, optional), noise (+- rpm on each reading), gaps ([[t0, t1], ...]: no samples taken in between) }.
+ * The road speed: speedAt(tMs), or kmh (km/h per 1000 rpm: geared to the revs, a pull in gear), else none. It
+ * comes as the car sends it: every vEvery ms (100), in steps of vStep km/h (0.1), vLag ms late (0); fed into the
+ * climb rate with each of its readings and each rpm sample.
  * The reading taken at k * period arrives at k * period + jitter: there the climb rate is fed and the screen's cue
  * run; the HUD's cue runs at each frame, and at once on a sample while the lights count or flash (never two frames
  * within 33 ms). Returns { ev: [{ t, kind ('s' sample, 'f' frame), rpm, show, screen, hud }], flashAt (the HUD's
  * first flash, ms), countAt (its first frame with the revs in the count), ons / offs (the times of the HUD's frames
- * where the flash came on / went off), climb, st }. ev.screen: the screen's cue
+ * where the flash came on / went off), firms (when a sample's cue turned firm: the ambient light's flash), climb, st }. ev.screen: the screen's cue
  * at that moment (drawn from the same state as the HUD's; with own, its cue from the sample), hud: the HUD's when
  * it drew.
  */
 function cueRun(Hud, o) {
     const rand = prng(o.seed || 1), nrand = prng((o.seed || 1) * 7919 + 13), frame = o.frame || 50, gap = 1000 / 30;
-    const speedAt = o.speedAt || (() => undefined), gaps = o.gaps || [], ons = [], offs = [];
-    let was = false;
+    const trueSpeed = o.speedAt || (isFinite(o.kmh) ? (t) => o.rpmAt(t) * o.kmh / 1000 : null), gaps = o.gaps || [], ons = [], offs = [];
+    const vStep = o.vStep || 0.1, vEvery = o.vEvery || 100, vLag = o.vLag || 0;
+    let was = false, wasFirm = false, vNow;
+    const firms = [];
+    const speedAt = () => vNow;
     const climb = {}, st = {}, stHud = o.own ? {} : st, ev = [];
     const max = o.redline - 50, gearAt = o.gearAt || (() => 3);
     const arrivals = [];
@@ -130,6 +136,8 @@ function cueRun(Hud, o) {
         if (gaps.some((g) => tk >= g[0] && tk < g[1])) continue;
         arrivals.push({ t: arrive, rpm: Math.round((o.rpmAt(tk) + n) * 4) / 4, gear: gearAt(tk) });
     }
+    // the speed's own readings, between the rpm samples
+    if (trueSpeed) for (let k = 0; k * vEvery <= o.until; k++) { const v = trueSpeed(Math.max(0, k * vEvery - vLag)); arrivals.push({ t: k * vEvery + 3, v: isFinite(v) ? Math.floor(v / vStep + 1e-9) * vStep : undefined }); }
     arrivals.sort((x, y) => x.t - y.t);
     let rpm = null, gear, last = null, drawnAt = -Infinity, bySample = false, flashAt = null, countAt = null, i = 0;
     const draw = (t, kind, screen) => {
@@ -149,9 +157,13 @@ function cueRun(Hud, o) {
         const tf = f * frame;
         while (i < arrivals.length && arrivals[i].t <= tf) {
             const a = arrivals[i++], n = climb.n;
+            if ('v' in a) { vNow = a.v; if (rpm !== null) Hud.climbFeed(climb, rpm, a.t, vNow); continue; }
             rpm = a.rpm; gear = a.gear;
-            Hud.climbFeed(climb, rpm, a.t);
+            Hud.climbFeed(climb, rpm, a.t, vNow);
             const screen = Hud.shiftCue(st, rpm, a.t, o.shift, o.redline, o.lead, gear, undefined, o.rev, climb, speedAt(a.t));
+            // (the ambient light's flash: main.js writes it when the sample's cue turns firm)
+            if (screen.firm && !wasFirm) firms.push(a.t);
+            wasFirm = !!screen.firm;
             if (climb.n !== n && last && (last.shift || rpm > last.from) && a.t - drawnAt >= gap) { drawnAt = a.t; bySample = true; draw(a.t, 's', screen); }
             else ev.push({ t: a.t, kind: 's', rpm: rpm, show: rpm, screen: screen, hud: null });
         }
@@ -159,7 +171,7 @@ function cueRun(Hud, o) {
         drawnAt = tf; bySample = false;
         draw(tf, 'f');
     }
-    return { ev: ev, flashAt: flashAt, countAt: countAt, ons: ons, offs: offs, climb: climb, st: st };
+    return { ev: ev, flashAt: flashAt, countAt: countAt, ons: ons, offs: offs, firms: firms, climb: climb, st: st };
 }
 
 module.exports = { ROOT, counter, sleep, hookKit, fakeClusterRender, claimsDir, rmTree, redlineDefaults, prng, cueRun };
